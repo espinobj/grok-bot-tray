@@ -48,10 +48,15 @@ Right-click the tray icon:
 | Show / Hide | Bring Grok Bot up or hide it to the tray |
 | Start with Windows | Checkmark toggle; adds or removes the Startup-folder shortcut |
 | Open log | Opens `%LOCALAPPDATA%\GrokBotTray\tray.log` in Notepad |
-| Check for updates | Asks GitHub for the newest version and offers to open this page if one is newer |
+| Auto-update | Checkmark toggle (on by default): check GitHub at start and daily, install newer versions automatically |
+| Check for updates | Asks GitHub for the newest version and offers Install now (or open this page) |
 | Quit Grok Bot | Closes Grok Bot and the helper |
 
 Left-click shows or hides Grok Bot. See [CHANGELOG.md](CHANGELOG.md) for what changed in each version.
+
+## Auto-update
+
+With **Auto-update** on, the helper checks GitHub about a minute after it starts and then every 24 hours. When a newer `vX.Y.Z` release, tag or branch exists it downloads that version, verifies the package, backs up your install to `%LOCALAPPDATA%\GrokBotTray.bak`, runs `install.ps1 -Upgrade` (keeping shortcuts, pin and the Start with Windows choice) and restarts the helper. If the new helper doesn't start within 30 seconds, the backup is restored and that version is skipped on later automatic checks. It waits if Grok Bot itself is updating. Details go to `tray.log`.
 
 ## Uninstall
 
