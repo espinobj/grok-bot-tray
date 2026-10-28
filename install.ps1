@@ -17,7 +17,8 @@ param(
   [switch]$NoStartup,
   [switch]$NoPinUpdate,
   [switch]$DesktopShortcut,
-  [switch]$NoLaunch
+  [switch]$NoLaunch,
+  [switch]$Upgrade   # used by the auto-updater: keep the current Start-with-Windows choice
 )
 $ErrorActionPreference = 'Stop'
 $src = Join-Path $PSScriptRoot 'src'
@@ -173,6 +174,7 @@ New-Item -ItemType Directory -Force -Path $dest | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $dest 'backup') | Out-Null
 Copy-Item (Join-Path $src 'GrokBotTray.ps1') $dest -Force
 Copy-Item (Join-Path $src 'launcher.cs') $dest -Force
+Copy-Item (Join-Path $src 'update.ps1') $dest -Force
 Copy-Item (Join-Path $PSScriptRoot 'uninstall.ps1') $dest -Force
 Copy-Item (Join-Path $PSScriptRoot 'VERSION') $dest -Force
 foreach ($old in 'exe.txt', 'GrokBotTray.vbs') { Remove-Item (Join-Path $dest $old) -Force -ErrorAction SilentlyContinue }
@@ -223,6 +225,7 @@ if ($aumid) { Say "App ID: $aumid" } else { Say 'App ID not found; a pinned help
 $startMenu = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\$name.lnk"
 Set-Lnk $startMenu $aumid
 $startup = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Startup\$name.lnk"
+if ($Upgrade -and -not (Test-Path $startup)) { $NoStartup = $true }
 if ($NoStartup) { Remove-Item $startup -Force -ErrorAction SilentlyContinue } else { Set-Lnk $startup $null }
 $desk = Join-Path ([Environment]::GetFolderPath('Desktop')) "$name.lnk"
 if ($DesktopShortcut -or (Test-Path $desk)) { Set-Lnk $desk $aumid }

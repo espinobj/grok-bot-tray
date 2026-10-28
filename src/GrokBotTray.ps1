@@ -42,6 +42,15 @@ try { $Version = (Get-Content (Join-Path $dir 'VERSION') -Raw).Trim() } catch {}
 $RepoSlug = 'espinobj/grok-bot-tray'
 $RepoUrl = "https://github.com/$RepoSlug"
 $startupLnk = Join-Path ([Environment]::GetFolderPath('Startup')) 'Grok Bot Tray.lnk'
+$settingsFile = Join-Path $dir 'settings.json'
+function Get-Settings {
+  $st = $null; try { $st = Get-Content $settingsFile -Raw | ConvertFrom-Json } catch {}
+  if (-not $st) { $st = [pscustomobject]@{} }
+  if ($null -eq $st.autoUpdate) { $st | Add-Member -NotePropertyName autoUpdate -NotePropertyValue $true -Force }
+  return $st
+}
+function Save-Settings($st) { try { $st | ConvertTo-Json | Set-Content $settingsFile -Encoding UTF8 } catch { Log "Saving settings failed: $_" } }
+$script:settings = Get-Settings
 Log "Helper v$Version started for $exe"
 
 # --- tunables ---
@@ -181,26 +190,69 @@ function Set-Startup([bool]$on) {
 }
 
 function ConvertTo-Ver([string]$t) { $t = ($t -replace '^[vV]', '').Trim(); $v = $null; if ([version]::TryParse($t, [ref]$v)) { return $v }; return $null }
-function Get-LatestVersion {
-  # Newest of: latest release, tags, and vX.Y.Z branches (repo may publish any of these).
+$AutoCheckDelaySec = 60; $AutoCheckEveryHours = 24
+function Get-Latest {
+  # Newest of: latest release, tags, and vX.Y.Z branches. Returns @{ Version; Ref } or $null.
   [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
   $h = @{ 'User-Agent' = "GrokBotTray/$Version"; 'Accept' = 'application/vnd.github+json' }
   $names = @()
-  try { $names += (Invoke-RestMethod -Uri "https://api.github.com/repos/$RepoSlug/releases/latest" -Headers $h -TimeoutSec 10).tag_name } catch {}
-  try { $names += @(Invoke-RestMethod -Uri "https://api.github.com/repos/$RepoSlug/tags" -Headers $h -TimeoutSec 10 | ForEach-Object { $_.name }) } catch {}
-  try { $names += @(Invoke-RestMethod -Uri "https://api.github.com/repos/$RepoSlug/branches" -Headers $h -TimeoutSec 10 | ForEach-Object { $_.name } | Where-Object { $_ -match '^v\d+\.\d+' }) } catch {}
+  try { $names += (Invoke-RestMethod -Uri "https://api.github.com/repos/$RepoSlug/releases/latest" -Headers $h -TimeoutSec 15).tag_name } catch {}
+  try { $names += @((Invoke-RestMethod -Uri "https://api.github.com/repos/$RepoSlug/tags" -Headers $h -TimeoutSec 15) | ForEach-Object { $_ } | ForEach-Object { $_.name }) } catch {}
+  try { $names += @((Invoke-RestMethod -Uri "https://api.github.com/repos/$RepoSlug/branches" -Headers $h -TimeoutSec 15) | ForEach-Object { $_ } | ForEach-Object { $_.name } | Where-Object { $_ -match '^v\d+\.\d+' }) } catch {}
   $best = $null
-  foreach ($n in $names) { $v = ConvertTo-Ver $n; if ($v -and (-not $best -or $v -gt $best)) { $best = $v } }
+  foreach ($n in $names) { $v = ConvertTo-Ver $n; if ($v -and (-not $best -or $v -gt $best.Version)) { $best = @{ Version = $v; Ref = $n } } }
   return $best
 }
+function Get-LatestVersion { $l = Get-Latest; if ($l) { return $l.Version }; return $null }
+
+function Install-Update($latest) {
+  # Download the ref zip, verify it, then hand off to a detached updater (it backs up, installs, rolls back on failure).
+  if ($script:state -in 'Updating', 'AfterUpdate' -or (Get-UpdateSignal)) { Log 'Helper update postponed: Grok Bot itself is updating'; return $false }
+  $want = $latest.Version.ToString()
+  $ProgressPreference = 'SilentlyContinue'
+  try {
+    $tmp = Join-Path $env:TEMP ("GrokBotTray-update-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+    $zip = Join-Path $tmp 'pkg.zip'
+    $url = "https://github.com/$RepoSlug/archive/$($latest.Ref).zip"
+    Log "Downloading $url"
+    Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing -TimeoutSec 60 -Headers @{ 'User-Agent' = "GrokBotTray/$Version" }
+    Expand-Archive -Path $zip -DestinationPath (Join-Path $tmp 'x') -Force
+    $pkg = @(Get-ChildItem (Join-Path $tmp 'x') -Directory)[0].FullName
+    foreach ($f in 'VERSION', 'install.ps1', 'src\GrokBotTray.ps1', 'src\update.ps1', 'src\launcher.cs') {
+      if (-not (Test-Path (Join-Path $pkg $f))) { throw "package is missing $f" }
+    }
+    $pv = (Get-Content (Join-Path $pkg 'VERSION') -Raw).Trim()
+    if ($pv -ne $want) { throw "package VERSION is $pv, expected $want" }
+    # Run the updater from the NEW package (copied out of the install dir so the backup/restore can replace files freely).
+    $upd = Join-Path $tmp 'update.ps1'; Copy-Item (Join-Path $pkg 'src\update.ps1') $upd -Force
+    Log "Package v$pv verified; starting updater"
+    Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$upd`"", '-Src', "`"$pkg`"", '-Expected', $pv, '-Dest', "`"$dir`"")
+    $ni.ShowBalloonTip(3000, 'Grok Bot Tray', "Updating the tray helper to v$pv...", 'Info')
+    return $true
+  } catch { Log "Helper update failed before install: $_"; $ni.ShowBalloonTip(4000, 'Grok Bot Tray', "Update failed: $_", 'Warning'); return $false }
+}
+
+function Invoke-AutoCheck {
+  $script:settings | Add-Member -NotePropertyName lastCheck -NotePropertyValue (Get-Date).ToString('s') -Force
+  Save-Settings $script:settings
+  $latest = Get-Latest
+  $cur = ConvertTo-Ver $Version
+  if (-not $latest) { Log 'Auto-update check: GitHub not reachable'; return }
+  Log "Auto-update check: installed $Version, latest $($latest.Version) ($($latest.Ref))"
+  if ($cur -and $latest.Version -le $cur) { return }
+  if ($script:settings.failedVersion -and $script:settings.failedVersion -eq $latest.Version.ToString()) { Log "Skipping v$($latest.Version): it failed and was rolled back before. Use Check for updates to retry."; return }
+  [void](Install-Update $latest)
+}
+
 function Check-Updates {
   $cur = ConvertTo-Ver $Version
-  $latest = Get-LatestVersion
+  $latest = Get-Latest
   if (-not $latest) { $ni.ShowBalloonTip(4000, 'Grok Bot Tray', 'Could not reach GitHub to check for updates.', 'Warning'); Log 'Update check failed'; return }
-  Log "Update check: installed $Version, latest $latest"
-  if ($cur -and $latest -le $cur) { $ni.ShowBalloonTip(4000, 'Grok Bot Tray', "You have the latest version (v$Version).", 'Info'); return }
-  $r = [System.Windows.Forms.MessageBox]::Show("Grok Bot Tray v$latest is available (you have v$Version).`n`nOpen the GitHub page to download it?", 'Grok Bot Tray update', 'YesNo', 'Information')
-  if ($r -eq 'Yes') { Start-Process $RepoUrl }
+  Log "Update check: installed $Version, latest $($latest.Version)"
+  if ($cur -and $latest.Version -le $cur) { $ni.ShowBalloonTip(4000, 'Grok Bot Tray', "You have the latest version (v$Version).", 'Info'); return }
+  $r = [System.Windows.Forms.MessageBox]::Show("Grok Bot Tray v$($latest.Version) is available (you have v$Version).`n`nYes = install now`nNo = open the GitHub page`nCancel = later", 'Grok Bot Tray update', 'YesNoCancel', 'Information')
+  if ($r -eq 'Yes') { [void](Install-Update $latest) } elseif ($r -eq 'No') { Start-Process $RepoUrl }
 }
 
 # --- tray icon (drawn at the exact small-icon size so the badge stays visible) ---
@@ -220,8 +272,11 @@ $miStartup.CheckOnClick = $false
 $miStartup.add_Click({ Set-Startup (-not (Test-Path -LiteralPath $startupLnk)) })
 $cm.Items.Add($miStartup) | Out-Null
 $cm.Items.Add('Open log').add_Click({ if (-not (Test-Path $logFile)) { Log 'Log opened' }; Start-Process notepad.exe -ArgumentList ('"' + $logFile + '"') }) | Out-Null
+$miAuto = New-Object System.Windows.Forms.ToolStripMenuItem('Auto-update')
+$miAuto.add_Click({ $script:settings.autoUpdate = -not [bool]$script:settings.autoUpdate; Save-Settings $script:settings; Log "Auto-update: $($script:settings.autoUpdate)" })
+$cm.Items.Add($miAuto) | Out-Null
 $cm.Items.Add('Check for updates').add_Click({ Check-Updates }) | Out-Null
-$cm.add_Opening({ $miStartup.Checked = Test-Path -LiteralPath $startupLnk })
+$cm.add_Opening({ $miStartup.Checked = Test-Path -LiteralPath $startupLnk; $miAuto.Checked = [bool]$script:settings.autoUpdate })
 $cm.Items.Add('-') | Out-Null
 $cm.Items.Add('Quit Grok Bot').add_Click({ Quit-All }) | Out-Null
 $ni.ContextMenuStrip = $cm
@@ -233,6 +288,18 @@ $ni.add_MouseClick({ param($s, $e)
 
 if (Test-Running) { [void](Attach-Main) } else { Start-App $false }
 
+$resFile = Join-Path $dir 'update-result.json'
+if (Test-Path $resFile) {
+  try {
+    $res = Get-Content $resFile -Raw | ConvertFrom-Json
+    if ($res.ok) { $ni.ShowBalloonTip(5000, 'Grok Bot Tray updated', "Now running v$Version. $($res.message).", 'Info') }
+    else { $ni.ShowBalloonTip(6000, 'Grok Bot Tray update failed', "$($res.message). See Open log.", 'Warning') }
+    Log "Update result: $($res.message)"
+  } catch {}
+  Remove-Item $resFile -Force -ErrorAction SilentlyContinue
+}
+$script:nextAutoCheck = (Get-Date).AddSeconds($AutoCheckDelaySec)
+
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 1000
 $timer.add_Tick({
@@ -240,6 +307,13 @@ $timer.add_Tick({
     if ($script:quitting) { return }
     if ($showEvent.WaitOne(0)) { $script:hideNext = $false; Show-App }
     $now = Get-Date
+    if ($now -ge $script:nextAutoCheck) {
+      $script:nextAutoCheck = $now.AddHours($AutoCheckEveryHours)
+      if ($script:settings.autoUpdate) {
+        if ($script:state -in 'Updating', 'AfterUpdate') { $script:nextAutoCheck = $now.AddMinutes(10); Log 'Auto-update check postponed: Grok Bot is updating' }
+        else { Invoke-AutoCheck }
+      }
+    }
     switch ($script:state) {
       'Running' {
         $alive = $false
