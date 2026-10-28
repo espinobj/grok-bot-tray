@@ -1,5 +1,8 @@
 # Grok Bot Tray (unofficial)
 
+**Current stable release: v1.2.1** (branch `v1.2.1`; see [CHANGELOG.md](CHANGELOG.md)).
+
+
 > **Unofficial community tool.** Not affiliated with, endorsed by, or supported by xAI. "Grok" and "Grok Bot" are names of their owner. This helper never modifies Grok Bot's own files.
 
 A small per-user helper for Windows that keeps the **Grok Bot** desktop app in the notification area (system tray):
@@ -57,6 +60,10 @@ Left-click shows or hides Grok Bot. See [CHANGELOG.md](CHANGELOG.md) for what ch
 ## Auto-update
 
 With **Auto-update** on, the helper checks GitHub about a minute after it starts and then every 24 hours. When a newer `vX.Y.Z` release, tag or branch exists it downloads that version, verifies the package, backs up your install to `%LOCALAPPDATA%\GrokBotTray.bak`, runs `install.ps1 -Upgrade` (keeping shortcuts, pin and the Start with Windows choice) and restarts the helper. If the new helper doesn't start within 30 seconds, the backup is restored and that version is skipped on later automatic checks. It waits if Grok Bot itself is updating. Details go to `tray.log`.
+
+### Testing updates locally (developers only)
+
+Add `"devUpdateSource": "C:\\path\\to\\package-folder-or.zip"` to `%LOCALAPPDATA%\GrokBotTray\settings.json` and restart the helper. Update checks then read that package instead of GitHub. The folder or zip must contain one top-level folder holding `VERSION`, `install.ps1` and `src\`. Remove the setting when done.
 
 ## Uninstall
 

@@ -1,6 +1,18 @@
 # Changelog
 
-## v1.2.0 - 2026-10-28
+## v1.2.1 - 2026-10-28 (current stable release)
+
+Tested on Windows 11 / Windows PowerShell 5.1: automatic upgrade, rollback of a deliberately broken package (one notification), and no retry of a failed version.
+
+- Fix: the updater's "did the new helper start?" check always failed (`.Count` on a single CIM object is empty in Windows PowerShell 5.1), so every auto-update was rolled back. Now uses `@(...).Count`.
+- Updater also writes `%TEMP%\GrokBotTray-update.log`, and rollback no longer overwrites `tray.log`, so failures are diagnosable.
+- Fix: rollback now restores every file (it could leave the new VERSION behind), logs the restored version, and keeps tray.log.
+- Fix: the "updated" notification now appears (it was missed when the new helper started before the updater finished).
+- Hardening: only one updater can run at a time; the start check only counts log lines written after the update began; automatic update failures are logged without alerts (manual Check for updates still reports them); updater log size capped; TLS 1.2 forced for downloads.
+- Dev-only `devUpdateSource` setting to test updates from a local package (see README).
+- A failed version is retried only from Check for updates, never automatically, so there is at most one failure notification per version.
+
+## v1.2.0 - 2026-10-28 (superseded: its updater check always failed and rolled back)
 - **Auto-update**: checks GitHub about a minute after the helper starts and every 24 hours. If a newer version exists it downloads it, checks the package (VERSION matches, installer and scripts present), backs up `%LOCALAPPDATA%\GrokBotTray` to `GrokBotTray.bak`, runs the installer in `-Upgrade` mode and restarts the helper. If the new helper has not started within 30 seconds it rolls back and skips that version on later automatic checks.
 - Never updates while Grok Bot itself is updating.
 - Tray menu: new **Auto-update** toggle (on by default, saved in `settings.json`); **Check for updates** now offers **Install now**.
