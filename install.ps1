@@ -102,25 +102,32 @@ function Get-AppIconBitmap([string]$exe, [int]$size) {
 }
 
 function New-BadgedFrame([string]$exe, [int]$size) {
-  $bmp = Get-AppIconBitmap $exe $size
+  # v1.1.0: clearly different from the stock icon even at 16 px:
+  # blue-tinted app logo inside a thick blue rounded frame, plus an orange corner badge.
+  $src = Get-AppIconBitmap $exe $size
+  $bmp = New-Object System.Drawing.Bitmap($size, $size)
   $g = [System.Drawing.Graphics]::FromImage($bmp)
-  $g.SmoothingMode = 'AntiAlias'; $g.PixelOffsetMode = 'HighQuality'
-  # Badge is larger on small sizes so it stays visible in the tray.
-  $ratio = if ($size -le 20) { 0.62 } elseif ($size -le 32) { 0.56 } elseif ($size -le 48) { 0.5 } else { 0.44 }
-  $d = [Math]::Round($size * $ratio)
+  $g.SmoothingMode = 'AntiAlias'; $g.PixelOffsetMode = 'HighQuality'; $g.InterpolationMode = 'HighQualityBicubic'
+  $blueC = [System.Drawing.Color]::FromArgb(255, 0, 120, 215)
+  $blue = New-Object System.Drawing.SolidBrush($blueC)
+  $b = [Math]::Max(2, [Math]::Round($size * 0.14))          # frame thickness (2 px at 16)
+  $g.FillRectangle($blue, 0, 0, $size, $size)               # solid blue tile
+  # tint the logo blue-ish so it reads as "not the stock icon"
+  $cm = New-Object System.Drawing.Imaging.ColorMatrix
+  $cm.Matrix00 = 0.55; $cm.Matrix11 = 0.75; $cm.Matrix22 = 1.0; $cm.Matrix33 = 1.0
+  $cm.Matrix40 = 0.0; $cm.Matrix41 = 0.1; $cm.Matrix42 = 0.3
+  $ia = New-Object System.Drawing.Imaging.ImageAttributes; $ia.SetColorMatrix($cm)
+  $inner = $size - 2 * $b
+  $g.FillRectangle([System.Drawing.Brushes]::White, $b, $b, $inner, $inner)
+  $g.DrawImage($src, (New-Object System.Drawing.Rectangle($b, $b, $inner, $inner)), 0, 0, $src.Width, $src.Height, 'Pixel', $ia)
+  # orange corner badge, bottom-right
+  $d = [Math]::Round($size * $(if ($size -le 24) { 0.5 } else { 0.42 }))
   $x = $size - $d; $y = $size - $d
-  $ring = [Math]::Max(1, [Math]::Round($d * 0.12))
+  $orange = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 255, 140, 0))
   $g.FillEllipse([System.Drawing.Brushes]::White, $x, $y, $d, $d)
-  $blue = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 0, 120, 215))
-  $g.FillEllipse($blue, $x + $ring, $y + $ring, $d - 2 * $ring, $d - 2 * $ring)
-  if ($d -ge 12) {
-    # small white "tray" glyph: a bar with a stem, like an item sitting in the tray
-    $in = $d - 2 * $ring; $ox = $x + $ring; $oy = $y + $ring
-    $w = [Math]::Max(1.5, $in * 0.13)
-    $g.FillRectangle([System.Drawing.Brushes]::White, [float]($ox + $in / 2 - $w / 2), [float]($oy + $in * 0.24), [float]$w, [float]($in * 0.36))
-    $g.FillRectangle([System.Drawing.Brushes]::White, [float]($ox + $in * 0.24), [float]($oy + $in * 0.62), [float]($in * 0.52), [float]$w)
-  }
-  $g.Dispose(); $blue.Dispose()
+  $r = [Math]::Max(1, [Math]::Round($d * 0.14))
+  $g.FillEllipse($orange, $x + $r, $y + $r, $d - 2 * $r, $d - 2 * $r)
+  $g.Dispose(); $blue.Dispose(); $orange.Dispose(); $src.Dispose()
   return $bmp
 }
 
@@ -167,12 +174,14 @@ New-Item -ItemType Directory -Force -Path (Join-Path $dest 'backup') | Out-Null
 Copy-Item (Join-Path $src 'GrokBotTray.ps1') $dest -Force
 Copy-Item (Join-Path $src 'launcher.cs') $dest -Force
 Copy-Item (Join-Path $PSScriptRoot 'uninstall.ps1') $dest -Force
+Copy-Item (Join-Path $PSScriptRoot 'VERSION') $dest -Force
 foreach ($old in 'exe.txt', 'GrokBotTray.vbs') { Remove-Item (Join-Path $dest $old) -Force -ErrorAction SilentlyContinue }
 
 # ---------- icon ----------
 $ico = Join-Path $dest 'GrokBotTray.ico'
 $frames = @(16, 20, 24, 32, 40, 48, 64, 256 | ForEach-Object { New-BadgedFrame $AppPath $_ })
 Write-Ico $frames $ico
+if ($env:GBT_ICON_PREVIEW) { foreach ($f in $frames) { if ($f.Width -in 16, 24, 32) { $f.Save((Join-Path $env:GBT_ICON_PREVIEW ("tray-$($f.Width).png"))) } } }
 $frames | ForEach-Object { $_.Dispose() }
 Say 'Built badged icon'
 
@@ -236,4 +245,4 @@ if ($pinPath -and -not $NoPinUpdate) {
 try { Start-Process -FilePath (Join-Path $env:WINDIR 'System32\ie4uinit.exe') -ArgumentList '-show' -WindowStyle Hidden -Wait } catch {}
 
 if (-not $NoLaunch) { Start-Process -FilePath $launcher; Say 'Helper started. Look for the badged Grok Bot icon in the notification area.' }
-Say "Installed to $dest"
+Say "Installed v$((Get-Content (Join-Path $PSScriptRoot 'VERSION') -Raw).Trim()) to $dest"

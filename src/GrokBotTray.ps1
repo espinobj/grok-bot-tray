@@ -37,7 +37,12 @@ elseif (Test-Path (Join-Path $dir 'exe.txt')) { $exe = (Get-Content (Join-Path $
 else { Log 'No config.json; run install.ps1 first.'; exit 1 }
 $pname = [IO.Path]::GetFileNameWithoutExtension($exe)
 $installDir = Split-Path -Parent $exe
-Log "Helper started for $exe"
+$Version = '0.0.0'
+try { $Version = (Get-Content (Join-Path $dir 'VERSION') -Raw).Trim() } catch {}
+$RepoSlug = 'espinobj/grok-bot-tray'
+$RepoUrl = "https://github.com/$RepoSlug"
+$startupLnk = Join-Path ([Environment]::GetFolderPath('Startup')) 'Grok Bot Tray.lnk'
+Log "Helper v$Version started for $exe"
 
 # --- tunables ---
 $GraceCleanExitSec = 20    # after a clean exit (code 0), watch this long for an updater before relaunching
@@ -163,6 +168,41 @@ function Repair-Pin {
   } catch { Log "Repair-Pin failed: $_" }
 }
 
+function Set-Startup([bool]$on) {
+  try {
+    if ($on) {
+      $ws = New-Object -ComObject WScript.Shell
+      $s = $ws.CreateShortcut($startupLnk)
+      $s.TargetPath = Join-Path $dir 'Grok Bot Tray.exe'; $s.WorkingDirectory = $dir
+      $s.IconLocation = (Join-Path $dir 'GrokBotTray.ico') + ',0'; $s.Description = 'Grok Bot in the notification area (unofficial helper)'
+      $s.Save(); Log 'Start with Windows: on'
+    } else { Remove-Item -LiteralPath $startupLnk -Force -ErrorAction SilentlyContinue; Log 'Start with Windows: off' }
+  } catch { Log "Set-Startup failed: $_"; $ni.ShowBalloonTip(4000, 'Grok Bot Tray', "Could not change the startup setting: $_", 'Error') }
+}
+
+function ConvertTo-Ver([string]$t) { $t = ($t -replace '^[vV]', '').Trim(); $v = $null; if ([version]::TryParse($t, [ref]$v)) { return $v }; return $null }
+function Get-LatestVersion {
+  # Newest of: latest release, tags, and vX.Y.Z branches (repo may publish any of these).
+  [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+  $h = @{ 'User-Agent' = "GrokBotTray/$Version"; 'Accept' = 'application/vnd.github+json' }
+  $names = @()
+  try { $names += (Invoke-RestMethod -Uri "https://api.github.com/repos/$RepoSlug/releases/latest" -Headers $h -TimeoutSec 10).tag_name } catch {}
+  try { $names += @(Invoke-RestMethod -Uri "https://api.github.com/repos/$RepoSlug/tags" -Headers $h -TimeoutSec 10 | ForEach-Object { $_.name }) } catch {}
+  try { $names += @(Invoke-RestMethod -Uri "https://api.github.com/repos/$RepoSlug/branches" -Headers $h -TimeoutSec 10 | ForEach-Object { $_.name } | Where-Object { $_ -match '^v\d+\.\d+' }) } catch {}
+  $best = $null
+  foreach ($n in $names) { $v = ConvertTo-Ver $n; if ($v -and (-not $best -or $v -gt $best)) { $best = $v } }
+  return $best
+}
+function Check-Updates {
+  $cur = ConvertTo-Ver $Version
+  $latest = Get-LatestVersion
+  if (-not $latest) { $ni.ShowBalloonTip(4000, 'Grok Bot Tray', 'Could not reach GitHub to check for updates.', 'Warning'); Log 'Update check failed'; return }
+  Log "Update check: installed $Version, latest $latest"
+  if ($cur -and $latest -le $cur) { $ni.ShowBalloonTip(4000, 'Grok Bot Tray', "You have the latest version (v$Version).", 'Info'); return }
+  $r = [System.Windows.Forms.MessageBox]::Show("Grok Bot Tray v$latest is available (you have v$Version).`n`nOpen the GitHub page to download it?", 'Grok Bot Tray update', 'YesNo', 'Information')
+  if ($r -eq 'Yes') { Start-Process $RepoUrl }
+}
+
 # --- tray icon (drawn at the exact small-icon size so the badge stays visible) ---
 $ni = New-Object System.Windows.Forms.NotifyIcon
 try { $ni.Icon = New-Object System.Drawing.Icon((Join-Path $dir 'GrokBotTray.ico'), [System.Windows.Forms.SystemInformation]::SmallIconSize) }
@@ -170,8 +210,18 @@ catch { Log "Icon load failed: $_"; $ni.Icon = [System.Drawing.Icon]::ExtractAss
 $ni.Text = 'Grok Bot'
 $ni.Visible = $true
 $cm = New-Object System.Windows.Forms.ContextMenuStrip
+$hdr = $cm.Items.Add("Grok Bot Tray v$Version"); $hdr.Enabled = $false
+$cm.Items.Add('-') | Out-Null
 $cm.Items.Add('Show').add_Click({ Show-App }) | Out-Null
 $cm.Items.Add('Hide').add_Click({ Hide-App }) | Out-Null
+$cm.Items.Add('-') | Out-Null
+$miStartup = New-Object System.Windows.Forms.ToolStripMenuItem('Start with Windows')
+$miStartup.CheckOnClick = $false
+$miStartup.add_Click({ Set-Startup (-not (Test-Path -LiteralPath $startupLnk)) })
+$cm.Items.Add($miStartup) | Out-Null
+$cm.Items.Add('Open log').add_Click({ if (-not (Test-Path $logFile)) { Log 'Log opened' }; Start-Process notepad.exe -ArgumentList ('"' + $logFile + '"') }) | Out-Null
+$cm.Items.Add('Check for updates').add_Click({ Check-Updates }) | Out-Null
+$cm.add_Opening({ $miStartup.Checked = Test-Path -LiteralPath $startupLnk })
 $cm.Items.Add('-') | Out-Null
 $cm.Items.Add('Quit Grok Bot').add_Click({ Quit-All }) | Out-Null
 $ni.ContextMenuStrip = $cm
