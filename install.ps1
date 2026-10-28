@@ -1,0 +1,239 @@
+<#
+.SYNOPSIS
+  Installs Grok Bot Tray for the current user (no admin needed).
+  Unofficial community tool. Not affiliated with, endorsed by, or supported by xAI.
+.PARAMETER AppPath
+  Full path to "Grok Bot.exe". Auto-detected when omitted.
+.PARAMETER NoStartup
+  Do not start the helper when you sign in to Windows.
+.PARAMETER NoPinUpdate
+  Leave an existing Grok Bot taskbar pin alone.
+.PARAMETER DesktopShortcut
+  Also put a "Grok Bot Tray" shortcut on the desktop.
+#>
+[CmdletBinding()]
+param(
+  [string]$AppPath,
+  [switch]$NoStartup,
+  [switch]$NoPinUpdate,
+  [switch]$DesktopShortcut,
+  [switch]$NoLaunch
+)
+$ErrorActionPreference = 'Stop'
+$src = Join-Path $PSScriptRoot 'src'
+$dest = Join-Path $env:LOCALAPPDATA 'GrokBotTray'
+$name = 'Grok Bot Tray'
+function Say($m) { Write-Host "[Grok Bot Tray] $m" }
+
+# ---------- find Grok Bot ----------
+function Find-GrokBot {
+  $c = New-Object System.Collections.Generic.List[string]
+  $keys = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+          'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+          'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+  foreach ($k in $keys) {
+    foreach ($e in @(Get-ItemProperty $k -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like 'Grok Bot*' })) {
+      foreach ($v in @($e.DisplayIcon, $e.UninstallString, $e.InstallLocation)) {
+        if (-not $v) { continue }
+        $p = ($v -replace '"', '') -replace ',\s*\d+$', ''
+        $p = ($p -split ' /')[0].Trim()
+        if ($p -like '*.exe') { $p = Split-Path -Parent $p }
+        $c.Add((Join-Path $p 'Grok Bot.exe'))
+      }
+    }
+  }
+  $c.Add((Join-Path $env:LOCALAPPDATA 'Programs\Grok Bot\Grok Bot.exe'))
+  $c.Add((Join-Path $env:ProgramFiles 'Grok Bot\Grok Bot.exe'))
+  if (${env:ProgramFiles(x86)}) { $c.Add((Join-Path ${env:ProgramFiles(x86)} 'Grok Bot\Grok Bot.exe')) }
+  foreach ($p in $c) { if (Test-Path -LiteralPath $p) { return (Resolve-Path -LiteralPath $p).Path } }
+  return $null
+}
+if (-not $AppPath) { $AppPath = Find-GrokBot }
+if (-not $AppPath -or -not (Test-Path -LiteralPath $AppPath)) { throw 'Could not find "Grok Bot.exe". Install Grok Bot first, or pass -AppPath "C:\path\to\Grok Bot.exe".' }
+Say "Grok Bot found at $AppPath"
+
+# ---------- helpers: shortcut AppUserModelID + icon builder ----------
+Add-Type -AssemblyName System.Drawing
+Add-Type -TypeDefinition @"
+using System; using System.Runtime.InteropServices;
+public static class GBTInstall {
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)]
+  public static extern int PrivateExtractIcons(string file, int idx, int cx, int cy, IntPtr[] h, int[] id, int n, int flags);
+  [DllImport("user32.dll")] public static extern bool DestroyIcon(IntPtr h);
+
+  [StructLayout(LayoutKind.Sequential, Pack=4)] public struct PROPERTYKEY { public Guid fmtid; public uint pid; }
+  [StructLayout(LayoutKind.Explicit, Size=24)] public struct PROPVARIANT { [FieldOffset(0)] public ushort vt; [FieldOffset(8)] public IntPtr p; }
+  [ComImport, Guid("886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+  interface IPropertyStore {
+    int GetCount(out uint c); int GetAt(uint i, out PROPERTYKEY k);
+    int GetValue(ref PROPERTYKEY k, out PROPVARIANT v); int SetValue(ref PROPERTYKEY k, ref PROPVARIANT v); int Commit();
+  }
+  [DllImport("shell32.dll", CharSet=CharSet.Unicode)]
+  static extern int SHGetPropertyStoreFromParsingName(string path, IntPtr pbc, int flags, ref Guid iid, [MarshalAs(UnmanagedType.Interface)] out IPropertyStore ps);
+  static PROPERTYKEY AumidKey() { var k = new PROPERTYKEY(); k.fmtid = new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3"); k.pid = 5; return k; }
+
+  public static string GetAumid(string lnk) {
+    IPropertyStore ps; Guid iid = typeof(IPropertyStore).GUID;
+    if (SHGetPropertyStoreFromParsingName(lnk, IntPtr.Zero, 0, ref iid, out ps) != 0) return null;
+    try { var k = AumidKey(); PROPVARIANT v; ps.GetValue(ref k, out v); return v.vt == 31 ? Marshal.PtrToStringUni(v.p) : null; }
+    finally { Marshal.ReleaseComObject(ps); }
+  }
+  public static void SetAumid(string lnk, string aumid) {
+    IPropertyStore ps; Guid iid = typeof(IPropertyStore).GUID;
+    int hr = SHGetPropertyStoreFromParsingName(lnk, IntPtr.Zero, 2 /*GPS_READWRITE*/, ref iid, out ps);
+    if (hr != 0) Marshal.ThrowExceptionForHR(hr);
+    try {
+      var k = AumidKey(); var v = new PROPVARIANT(); v.vt = 31; v.p = Marshal.StringToCoTaskMemUni(aumid);
+      try { Marshal.ThrowExceptionForHR(ps.SetValue(ref k, ref v)); Marshal.ThrowExceptionForHR(ps.Commit()); }
+      finally { Marshal.FreeCoTaskMem(v.p); }
+    } finally { Marshal.ReleaseComObject(ps); }
+  }
+}
+"@
+
+function Get-AppIconBitmap([string]$exe, [int]$size) {
+  $h = New-Object IntPtr[] 1; $id = New-Object int[] 1
+  $n = [GBTInstall]::PrivateExtractIcons($exe, 0, $size, $size, $h, $id, 1, 0)
+  if ($n -ge 1 -and $h[0] -ne [IntPtr]::Zero) {
+    $ic = [System.Drawing.Icon]::FromHandle($h[0]); $bmp = New-Object System.Drawing.Bitmap($ic.ToBitmap()); [void][GBTInstall]::DestroyIcon($h[0]); return $bmp
+  }
+  $ic = [System.Drawing.Icon]::ExtractAssociatedIcon($exe)
+  return New-Object System.Drawing.Bitmap($ic.ToBitmap(), $size, $size)
+}
+
+function New-BadgedFrame([string]$exe, [int]$size) {
+  $bmp = Get-AppIconBitmap $exe $size
+  $g = [System.Drawing.Graphics]::FromImage($bmp)
+  $g.SmoothingMode = 'AntiAlias'; $g.PixelOffsetMode = 'HighQuality'
+  # Badge is larger on small sizes so it stays visible in the tray.
+  $ratio = if ($size -le 20) { 0.62 } elseif ($size -le 32) { 0.56 } elseif ($size -le 48) { 0.5 } else { 0.44 }
+  $d = [Math]::Round($size * $ratio)
+  $x = $size - $d; $y = $size - $d
+  $ring = [Math]::Max(1, [Math]::Round($d * 0.12))
+  $g.FillEllipse([System.Drawing.Brushes]::White, $x, $y, $d, $d)
+  $blue = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 0, 120, 215))
+  $g.FillEllipse($blue, $x + $ring, $y + $ring, $d - 2 * $ring, $d - 2 * $ring)
+  if ($d -ge 12) {
+    # small white "tray" glyph: a bar with a stem, like an item sitting in the tray
+    $in = $d - 2 * $ring; $ox = $x + $ring; $oy = $y + $ring
+    $w = [Math]::Max(1.5, $in * 0.13)
+    $g.FillRectangle([System.Drawing.Brushes]::White, [float]($ox + $in / 2 - $w / 2), [float]($oy + $in * 0.24), [float]$w, [float]($in * 0.36))
+    $g.FillRectangle([System.Drawing.Brushes]::White, [float]($ox + $in * 0.24), [float]($oy + $in * 0.62), [float]($in * 0.52), [float]$w)
+  }
+  $g.Dispose(); $blue.Dispose()
+  return $bmp
+}
+
+function Write-Ico([System.Drawing.Bitmap[]]$frames, [string]$path) {
+  $blobs = @()
+  foreach ($b in $frames) {
+    $ms = New-Object IO.MemoryStream
+    if ($b.Width -ge 256) { $b.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png) }
+    else {
+      # classic 32-bit DIB frame (best compatibility with System.Drawing.Icon and Explorer)
+      $w = $b.Width; $hgt = $b.Height
+      $maskStride = [int]([Math]::Ceiling($w / 32.0) * 4)
+      $bw = New-Object IO.BinaryWriter($ms)
+      $bw.Write([int]40); $bw.Write([int]$w); $bw.Write([int]($hgt * 2)); $bw.Write([int16]1); $bw.Write([int16]32)
+      $bw.Write([int]0); $bw.Write([int]($w * $hgt * 4 + $maskStride * $hgt)); $bw.Write([int]0); $bw.Write([int]0); $bw.Write([int]0); $bw.Write([int]0)
+      for ($yy = $hgt - 1; $yy -ge 0; $yy--) { for ($xx = 0; $xx -lt $w; $xx++) { $c = $b.GetPixel($xx, $yy); $bw.Write([byte]$c.B); $bw.Write([byte]$c.G); $bw.Write([byte]$c.R); $bw.Write([byte]$c.A) } }
+      $bw.Write((New-Object byte[] ($maskStride * $hgt)))
+      $bw.Flush()
+    }
+    $blobs += , $ms.ToArray()
+  }
+  $fs = [IO.File]::Create($path); $bw = New-Object IO.BinaryWriter($fs)
+  $bw.Write([int16]0); $bw.Write([int16]1); $bw.Write([int16]$frames.Count)
+  $offset = 6 + 16 * $frames.Count
+  for ($i = 0; $i -lt $frames.Count; $i++) {
+    $s = $frames[$i].Width; $sz = if ($s -ge 256) { 0 } else { $s }
+    $bw.Write([byte]$sz); $bw.Write([byte]$sz); $bw.Write([byte]0); $bw.Write([byte]0)
+    $bw.Write([int16]1); $bw.Write([int16]32); $bw.Write([int]$blobs[$i].Length); $bw.Write([int]$offset)
+    $offset += $blobs[$i].Length
+  }
+  foreach ($bl in $blobs) { $bw.Write($bl) }
+  $bw.Close()
+}
+
+# ---------- stop a running helper (never touches Grok Bot itself) ----------
+Get-CimInstance Win32_Process -Filter "Name='powershell.exe' OR Name='pwsh.exe'" |
+  Where-Object { $_.CommandLine -match 'GrokBotTray\.ps1' -and $_.ProcessId -ne $PID } |
+  ForEach-Object { Say "Stopping running helper (PID $($_.ProcessId))"; Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+Start-Sleep -Milliseconds 500
+
+# ---------- copy files ----------
+New-Item -ItemType Directory -Force -Path $dest | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $dest 'backup') | Out-Null
+Copy-Item (Join-Path $src 'GrokBotTray.ps1') $dest -Force
+Copy-Item (Join-Path $src 'launcher.cs') $dest -Force
+Copy-Item (Join-Path $PSScriptRoot 'uninstall.ps1') $dest -Force
+foreach ($old in 'exe.txt', 'GrokBotTray.vbs') { Remove-Item (Join-Path $dest $old) -Force -ErrorAction SilentlyContinue }
+
+# ---------- icon ----------
+$ico = Join-Path $dest 'GrokBotTray.ico'
+$frames = @(16, 20, 24, 32, 40, 48, 64, 256 | ForEach-Object { New-BadgedFrame $AppPath $_ })
+Write-Ico $frames $ico
+$frames | ForEach-Object { $_.Dispose() }
+Say 'Built badged icon'
+
+# ---------- launcher exe ----------
+$launcher = Join-Path $dest "$name.exe"
+$csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+if (-not (Test-Path $csc)) { $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework\v4.0.30319\csc.exe' }
+if (-not (Test-Path $csc)) { throw 'The .NET Framework 4 C# compiler (csc.exe) was not found; it ships with Windows 10 and 11.' }
+$out = & $csc /nologo /target:winexe /optimize+ "/win32icon:$ico" "/out:$launcher" (Join-Path $dest 'launcher.cs') 2>&1
+if ($LASTEXITCODE -ne 0) { throw "Launcher build failed: $out" }
+Say 'Built launcher'
+
+# ---------- shortcuts ----------
+$ws = New-Object -ComObject WScript.Shell
+function Set-Lnk([string]$path, [string]$aumid) {
+  $s = $ws.CreateShortcut($path)
+  $s.TargetPath = $launcher; $s.WorkingDirectory = $dest; $s.IconLocation = "$ico,0"; $s.Description = 'Grok Bot in the notification area (unofficial helper)'
+  $s.Save()
+  if ($aumid) { try { [GBTInstall]::SetAumid($path, $aumid) } catch { Write-Warning "Could not set AppUserModelID on $path : $_" } }
+}
+
+# Find the app's AppUserModelID from its own shortcuts so a pinned helper groups with the app window.
+$pinDir = Join-Path $env:APPDATA 'Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar'
+$appLnks = @()
+foreach ($d in @($pinDir, (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'), (Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs'))) {
+  if (Test-Path $d) { $appLnks += @(Get-ChildItem $d -Filter *.lnk -Recurse -ErrorAction SilentlyContinue) }
+}
+$aumid = $null; $pinPath = $null
+foreach ($l in $appLnks) {
+  $t = $ws.CreateShortcut($l.FullName).TargetPath
+  if ($t -ieq $AppPath -or $t -ieq $launcher) {
+    $a = [GBTInstall]::GetAumid($l.FullName)
+    if ($l.DirectoryName -ieq $pinDir) { $pinPath = $l.FullName; if ($a) { $aumid = $a } }
+    elseif (-not $aumid -and $a -and $a -notlike 'electron.app.*') { $aumid = $a }
+  }
+}
+if ($aumid) { Say "App ID: $aumid" } else { Say 'App ID not found; a pinned helper will show as its own taskbar button.' }
+
+$startMenu = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\$name.lnk"
+Set-Lnk $startMenu $aumid
+$startup = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Startup\$name.lnk"
+if ($NoStartup) { Remove-Item $startup -Force -ErrorAction SilentlyContinue } else { Set-Lnk $startup $null }
+$desk = Join-Path ([Environment]::GetFolderPath('Desktop')) "$name.lnk"
+if ($DesktopShortcut -or (Test-Path $desk)) { Set-Lnk $desk $aumid }
+
+if ($pinPath -and -not $NoPinUpdate) {
+  $bk = Join-Path $dest 'backup\taskbar-pin.lnk'
+  if ($ws.CreateShortcut($pinPath).TargetPath -ieq $AppPath -and -not (Test-Path $bk)) { Copy-Item $pinPath $bk }
+  Set-Lnk $pinPath $aumid
+  Say 'Taskbar pin now opens the helper and shows the badged icon'
+} elseif (-not $pinPath) {
+  Say 'Tip: to pin it, open Start, find "Grok Bot Tray", right-click it and choose Pin to taskbar.'
+  $pinPath = $null
+}
+
+# ---------- config ----------
+[ordered]@{ exe = $AppPath; aumid = $aumid; pinPath = $(if ($NoPinUpdate) { $null } else { $pinPath }); installed = (Get-Date).ToString('s') } |
+  ConvertTo-Json | Set-Content -Path (Join-Path $dest 'config.json') -Encoding UTF8
+
+# refresh Explorer's icon cache so the new icon shows without signing out
+try { Start-Process -FilePath (Join-Path $env:WINDIR 'System32\ie4uinit.exe') -ArgumentList '-show' -WindowStyle Hidden -Wait } catch {}
+
+if (-not $NoLaunch) { Start-Process -FilePath $launcher; Say 'Helper started. Look for the badged Grok Bot icon in the notification area.' }
+Say "Installed to $dest"
