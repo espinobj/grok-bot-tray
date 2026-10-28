@@ -38,6 +38,21 @@ What it sets up:
 
 Re-running `install.ps1` upgrades in place.
 
+## Tray menu
+
+Right-click the tray icon:
+
+| Item | What it does |
+|---|---|
+| **Grok Bot Tray vX.Y.Z** | Shows the installed helper version (from the `VERSION` file) |
+| Show / Hide | Bring Grok Bot up or hide it to the tray |
+| Start with Windows | Checkmark toggle; adds or removes the Startup-folder shortcut |
+| Open log | Opens `%LOCALAPPDATA%\GrokBotTray\tray.log` in Notepad |
+| Check for updates | Asks GitHub for the newest version and offers to open this page if one is newer |
+| Quit Grok Bot | Closes Grok Bot and the helper |
+
+Left-click shows or hides Grok Bot. See [CHANGELOG.md](CHANGELOG.md) for what changed in each version.
+
 ## Uninstall
 
 Double-click `uninstall.cmd` (in the download, or in `%LOCALAPPDATA%\GrokBotTray` via `uninstall.ps1`), or run:
