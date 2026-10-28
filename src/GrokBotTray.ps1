@@ -191,7 +191,30 @@ function Set-Startup([bool]$on) {
 
 function ConvertTo-Ver([string]$t) { $t = ($t -replace '^[vV]', '').Trim(); $v = $null; if ([version]::TryParse($t, [ref]$v)) { return $v }; return $null }
 $AutoCheckDelaySec = 60; $AutoCheckEveryHours = 24
+function Get-DevSource {
+  # DEV/TEST ONLY: settings.json "devUpdateSource" = local package folder or .zip used instead of GitHub.
+  $p = $script:settings.devUpdateSource
+  if ($p -and (Test-Path -LiteralPath $p)) { return (Resolve-Path -LiteralPath $p).Path }
+  return $null
+}
+function Expand-DevSource([string]$p, [string]$into) {
+  if ($p -like '*.zip') { Expand-Archive -Path $p -DestinationPath $into -Force }
+  else { New-Item -ItemType Directory -Force -Path $into | Out-Null; Copy-Item -LiteralPath $p -Destination $into -Recurse -Force }
+  return @(Get-ChildItem $into -Directory)[0].FullName
+}
 function Get-Latest {
+  $dev = Get-DevSource
+  if ($dev) {
+    try {
+      $t = Join-Path $env:TEMP ('GrokBotTray-devpeek-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+      $pkg = Expand-DevSource $dev $t
+      $v = ConvertTo-Ver ((Get-Content (Join-Path $pkg 'VERSION') -Raw).Trim())
+      Remove-Item $t -Recurse -Force -ErrorAction SilentlyContinue
+      Log "DEV update source in use: $dev (v$v)"
+      if ($v) { return @{ Version = $v; Ref = 'dev'; Dev = $dev } }
+    } catch { Log "DEV update source unreadable: $_" }
+    return $null
+  }
   # Newest of: latest release, tags, and vX.Y.Z branches. Returns @{ Version; Ref } or $null.
   [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
   $h = @{ 'User-Agent' = "GrokBotTray/$Version"; 'Accept' = 'application/vnd.github+json' }
@@ -205,20 +228,25 @@ function Get-Latest {
 }
 function Get-LatestVersion { $l = Get-Latest; if ($l) { return $l.Version }; return $null }
 
-function Install-Update($latest) {
+function Install-Update($latest, [bool]$manual = $false) {
+  if ($script:installing -and ((Get-Date) - $script:installing).TotalMinutes -lt 5) { Log 'Update already in progress'; return $false }
   # Download the ref zip, verify it, then hand off to a detached updater (it backs up, installs, rolls back on failure).
   if ($script:state -in 'Updating', 'AfterUpdate' -or (Get-UpdateSignal)) { Log 'Helper update postponed: Grok Bot itself is updating'; return $false }
   $want = $latest.Version.ToString()
   $ProgressPreference = 'SilentlyContinue'
+  [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
   try {
     $tmp = Join-Path $env:TEMP ("GrokBotTray-update-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
     New-Item -ItemType Directory -Force -Path $tmp | Out-Null
-    $zip = Join-Path $tmp 'pkg.zip'
-    $url = "https://github.com/$RepoSlug/archive/$($latest.Ref).zip"
-    Log "Downloading $url"
-    Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing -TimeoutSec 60 -Headers @{ 'User-Agent' = "GrokBotTray/$Version" }
-    Expand-Archive -Path $zip -DestinationPath (Join-Path $tmp 'x') -Force
-    $pkg = @(Get-ChildItem (Join-Path $tmp 'x') -Directory)[0].FullName
+    if ($latest.Dev) { $pkg = Expand-DevSource $latest.Dev (Join-Path $tmp 'x'); Log "Using DEV package $($latest.Dev)" }
+    else {
+      $zip = Join-Path $tmp 'pkg.zip'
+      $url = "https://github.com/$RepoSlug/archive/$($latest.Ref).zip"
+      Log "Downloading $url"
+      Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing -TimeoutSec 60 -Headers @{ 'User-Agent' = "GrokBotTray/$Version" }
+      Expand-Archive -Path $zip -DestinationPath (Join-Path $tmp 'x') -Force
+      $pkg = @(Get-ChildItem (Join-Path $tmp 'x') -Directory)[0].FullName
+    }
     foreach ($f in 'VERSION', 'install.ps1', 'src\GrokBotTray.ps1', 'src\update.ps1', 'src\launcher.cs') {
       if (-not (Test-Path (Join-Path $pkg $f))) { throw "package is missing $f" }
     }
@@ -228,9 +256,15 @@ function Install-Update($latest) {
     $upd = Join-Path $tmp 'update.ps1'; Copy-Item (Join-Path $pkg 'src\update.ps1') $upd -Force
     Log "Package v$pv verified; starting updater"
     Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$upd`"", '-Src', "`"$pkg`"", '-Expected', $pv, '-Dest', "`"$dir`"")
-    $ni.ShowBalloonTip(3000, 'Grok Bot Tray', "Updating the tray helper to v$pv...", 'Info')
+    $script:installing = Get-Date
+    if ($manual) { $ni.ShowBalloonTip(3000, 'Grok Bot Tray', "Updating the tray helper to v$pv...", 'Info') }
     return $true
-  } catch { Log "Helper update failed before install: $_"; $ni.ShowBalloonTip(4000, 'Grok Bot Tray', "Update failed: $_", 'Warning'); return $false }
+  } catch {
+    Log "Helper update failed before install: $_"
+    # Automatic attempts only log (no alert); they retry on the next daily check.
+    if ($manual) { $ni.ShowBalloonTip(4000, 'Grok Bot Tray', "Update failed: $_", 'Warning') }
+    return $false
+  }
 }
 
 function Invoke-AutoCheck {
@@ -252,7 +286,7 @@ function Check-Updates {
   Log "Update check: installed $Version, latest $($latest.Version)"
   if ($cur -and $latest.Version -le $cur) { $ni.ShowBalloonTip(4000, 'Grok Bot Tray', "You have the latest version (v$Version).", 'Info'); return }
   $r = [System.Windows.Forms.MessageBox]::Show("Grok Bot Tray v$($latest.Version) is available (you have v$Version).`n`nYes = install now`nNo = open the GitHub page`nCancel = later", 'Grok Bot Tray update', 'YesNoCancel', 'Information')
-  if ($r -eq 'Yes') { [void](Install-Update $latest) } elseif ($r -eq 'No') { Start-Process $RepoUrl }
+  if ($r -eq 'Yes') { [void](Install-Update $latest $true) } elseif ($r -eq 'No') { Start-Process $RepoUrl }
 }
 
 # --- tray icon (drawn at the exact small-icon size so the badge stays visible) ---
@@ -289,7 +323,9 @@ $ni.add_MouseClick({ param($s, $e)
 if (Test-Running) { [void](Attach-Main) } else { Start-App $false }
 
 $resFile = Join-Path $dir 'update-result.json'
-if (Test-Path $resFile) {
+function Show-UpdateResult {
+  # The updater writes this after it has verified the new helper, so poll for it.
+  if (-not (Test-Path $resFile)) { return }
   try {
     $res = Get-Content $resFile -Raw | ConvertFrom-Json
     if ($res.ok) { $ni.ShowBalloonTip(5000, 'Grok Bot Tray updated', "Now running v$Version. $($res.message).", 'Info') }
@@ -307,6 +343,7 @@ $timer.add_Tick({
     if ($script:quitting) { return }
     if ($showEvent.WaitOne(0)) { $script:hideNext = $false; Show-App }
     $now = Get-Date
+    Show-UpdateResult
     if ($now -ge $script:nextAutoCheck) {
       $script:nextAutoCheck = $now.AddHours($AutoCheckEveryHours)
       if ($script:settings.autoUpdate) {
