@@ -31,7 +31,7 @@ if (-not $KeepFiles -and (Test-Path $dest)) {
   Start-Sleep 1
   if ($PSScriptRoot -ieq $dest) {
     Start-Process cmd.exe -ArgumentList "/c timeout /t 2 >nul & rmdir /s /q `"$dest`"" -WindowStyle Hidden
-  } else { Remove-Item $dest -Recurse -Force }
+  } else { Remove-Item $dest -Recurse -Force; Remove-Item "$dest.bak" -Recurse -Force -ErrorAction SilentlyContinue }
   Say "Removed $dest"
 }
 Say 'Uninstalled. Grok Bot itself was not changed.'
