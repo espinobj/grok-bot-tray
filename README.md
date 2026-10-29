@@ -1,6 +1,6 @@
 # Grok Bot Tray (unofficial)
 
-**Current stable release: v1.2.1** (branch `v1.2.1`; see [CHANGELOG.md](CHANGELOG.md)).
+**Current stable release: v1.2.2** (branch `v1.2.2`; see [CHANGELOG.md](CHANGELOG.md)).
 
 
 > **Unofficial community tool.** Not affiliated with, endorsed by, or supported by xAI. "Grok" and "Grok Bot" are names of their owner. This helper never modifies Grok Bot's own files.
@@ -10,7 +10,7 @@ A small per-user helper for Windows that keeps the **Grok Bot** desktop app in t
 - Left-click the tray icon to show or hide Grok Bot. Minimizing hides it to the tray.
 - Starts with Windows (optional) and keeps Grok Bot running if it crashes.
 - **Update-aware:** when Grok Bot closes to install an update, the helper waits for the installer to finish instead of relaunching the app mid-update, then reattaches (or starts it if the installer didn't).
-- Uses a badged copy of the app icon (blue dot) so you can tell the helper apart from the regular app, in the tray and on a taskbar pin.
+- Uses its own green bot icon (`assets/icon.png.b64`, a base64-encoded PNG) so you can tell the helper apart from the regular app, in the tray, on the launcher and on a taskbar pin.
 
 No admin rights needed. Everything lives in `%LOCALAPPDATA%\GrokBotTray`.
 
@@ -35,9 +35,9 @@ The installer finds Grok Bot automatically (per-user or all-users install). Opti
 
 What it sets up:
 
-- `%LOCALAPPDATA%\GrokBotTray` with the helper script, a tiny launcher exe (compiled on your PC with the C# compiler built into Windows), a badged icon made from your installed Grok Bot icon, and `config.json`.
+- `%LOCALAPPDATA%\GrokBotTray` with the helper script, a tiny launcher exe (compiled on your PC with the C# compiler built into Windows), the helper icon (built from `assets/icon.png.b64`, a base64-encoded PNG, 16-256 px), and `config.json`.
 - A **Grok Bot Tray** shortcut in the Start menu, and one in your Startup folder.
-- If Grok Bot is already pinned to the taskbar, that pin is backed up and pointed at the helper with the badged icon. The pin keeps Grok Bot's app ID, so the open window still groups under it.
+- If Grok Bot is already pinned to the taskbar, that pin is backed up and pointed at the helper with the badged icon. The pin keeps Grok Bot's app ID, and the helper tags the open Grok Bot window with that same ID (a window property only; app files are never changed), so the window groups under the pin as one taskbar button.
 
 Re-running `install.ps1` upgrades in place.
 

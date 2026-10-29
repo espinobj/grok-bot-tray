@@ -1,6 +1,13 @@
 # Changelog
 
-## v1.2.1 - 2026-10-28 (current stable release)
+## v1.2.2 - 2026-10-28 (current stable release)
+
+Tested on Windows 11 / Windows PowerShell 5.1 (BlackKnight).
+
+- Fix: clicking the taskbar pin opened a second, separate Grok Bot taskbar button. The pin uses the app's shortcut ID (`com.anysphere.sand`), but the running window reports the app's process ID (`electron.app.Grok Bot`), so Windows treated them as two apps. The helper now tags the Grok Bot window with the pin's ID (window property only, app files untouched), so there is one taskbar button. Re-applied automatically whenever the app restarts or opens a new window.
+- New icon: green bot artwork (`assets/icon.png.b64`, a base64-encoded PNG), cropped tight with a transparent background, built into a 16-256 px .ico for the tray, launcher exe, pin and shortcuts. The old badged icon is only a fallback if the artwork is missing.
+
+## v1.2.1 - 2026-10-28
 
 Tested on Windows 11 / Windows PowerShell 5.1: automatic upgrade, rollback of a deliberately broken package (one notification), and no retry of a failed version.
 
