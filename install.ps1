@@ -181,6 +181,9 @@ foreach ($old in 'exe.txt', 'GrokBotTray.vbs') { Remove-Item (Join-Path $dest $o
 
 # ---------- icon ----------
 $ico = Join-Path $dest 'GrokBotTray.ico'
+# v1.2.3: shortcuts use a versioned copy so Explorer's icon cache can't keep showing an old image.
+$lnkIcoName = 'icon-v' + ((Get-Content (Join-Path $PSScriptRoot 'VERSION') -Raw).Trim() -replace '[^0-9A-Za-z]', '') + '.ico'
+$lnkIco = Join-Path $dest $lnkIcoName
 $iconB64 = Join-Path $PSScriptRoot 'assets\icon.png.b64'   # PNG stored as base64 text
 function New-IconFrame([int]$size) {
   # v1.2.2: green bot artwork (assets\icon.png.b64), clearly different from the stock Grok Bot icon.
@@ -197,6 +200,8 @@ $frames = @(16, 20, 24, 32, 40, 48, 64, 128, 256 | ForEach-Object { New-IconFram
 Write-Ico $frames $ico
 if ($env:GBT_ICON_PREVIEW) { foreach ($f in $frames) { if ($f.Width -in 16, 24, 32) { $f.Save((Join-Path $env:GBT_ICON_PREVIEW ("tray-$($f.Width).png"))) } } }
 $frames | ForEach-Object { $_.Dispose() }
+Get-ChildItem $dest -Filter 'icon-v*.ico' -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne $lnkIcoName } | Remove-Item -Force -ErrorAction SilentlyContinue
+Copy-Item $ico $lnkIco -Force
 Say 'Built helper icon'
 
 # ---------- launcher exe ----------
@@ -212,7 +217,7 @@ Say 'Built launcher'
 $ws = New-Object -ComObject WScript.Shell
 function Set-Lnk([string]$path, [string]$aumid) {
   $s = $ws.CreateShortcut($path)
-  $s.TargetPath = $launcher; $s.WorkingDirectory = $dest; $s.IconLocation = "$ico,0"; $s.Description = 'Grok Bot in the notification area (unofficial helper)'
+  $s.TargetPath = $launcher; $s.WorkingDirectory = $dest; $s.IconLocation = "$lnkIco,0"; $s.Description = 'Grok Bot in the notification area (unofficial helper)'
   $s.Save()
   if ($aumid) { try { [GBTInstall]::SetAumid($path, $aumid) } catch { Write-Warning "Could not set AppUserModelID on $path : $_" } }
 }
@@ -253,7 +258,7 @@ if ($pinPath -and -not $NoPinUpdate) {
 }
 
 # ---------- config ----------
-[ordered]@{ exe = $AppPath; aumid = $aumid; pinPath = $(if ($NoPinUpdate) { $null } else { $pinPath }); installed = (Get-Date).ToString('s') } |
+[ordered]@{ exe = $AppPath; aumid = $aumid; pinPath = $(if ($NoPinUpdate) { $null } else { $pinPath }); icon = $lnkIco; installed = (Get-Date).ToString('s') } |
   ConvertTo-Json | Set-Content -Path (Join-Path $dest 'config.json') -Encoding UTF8
 
 # refresh Explorer's icon cache so the new icon shows without signing out

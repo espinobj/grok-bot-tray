@@ -1,6 +1,11 @@
 # Changelog
 
-## v1.2.2 - 2026-10-28 (current stable release)
+## v1.2.3 - 2026-10-28 (current stable release)
+
+- Fix: after upgrading, the taskbar pin could keep showing the old icon because Explorer caches icons by file path. Shortcuts (pin, Start menu, Startup, desktop) now use a versioned icon file (`icon-v123.ico`, recorded in `config.json`); older `icon-v*.ico` files are removed. The tray keeps using `GrokBotTray.ico`.
+- Fix: while Grok Bot was opening, a second stock-icon taskbar button flashed up until the helper's 1-second timer tagged the window. The helper now uses a WinEvent hook (window create/show) to tag Grok Bot windows the instant they appear, and also sets the window's relaunch icon/command to the helper. The timer remains as a fallback.
+
+## v1.2.2 - 2026-10-28
 
 Tested on Windows 11 / Windows PowerShell 5.1 (BlackKnight).
 

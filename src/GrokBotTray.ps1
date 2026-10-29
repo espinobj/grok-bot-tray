@@ -19,6 +19,47 @@ public static class GBTWin {
   [DllImport("shell32.dll")] static extern int SHGetPropertyStoreForWindow(IntPtr h, ref Guid g, [MarshalAs(UnmanagedType.Interface)] out IPS s);
   // Give the app window the pinned shortcut's AppUserModelID so it groups under the helper pin
   // (the app's own process ID, e.g. electron.app.Grok Bot, differs from its shortcut ID).
+  static int SetStr(IPS s, uint pid, string val) {
+    PK k = new PK(); k.f = new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3"); k.p = pid;
+    PV v = new PV(); v.vt = 31; v.p = Marshal.StringToCoTaskMemUni(val);
+    try { return s.SetValue(ref k, ref v); } finally { Marshal.FreeCoTaskMem(v.p); }
+  }
+  // v1.2.3: tag new app windows the moment they are created/shown (WinEvent hook), so a second
+  // stock-icon button never flashes up. Also sets the relaunch icon to the helper icon.
+  public static string HookAumid, HookIcon, HookCmd, HookProc; public static int HookCount;
+  delegate void WinEventProc(IntPtr hook, uint ev, IntPtr h, int idObj, int idChild, uint thread, uint time);
+  [DllImport("user32.dll")] static extern IntPtr SetWinEventHook(uint min, uint max, IntPtr mod, WinEventProc cb, uint pid, uint tid, uint flags);
+  [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+  [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr h, uint f);
+  static WinEventProc cb; static IntPtr hook;
+  static System.Collections.Generic.Dictionary<uint, bool> pids = new System.Collections.Generic.Dictionary<uint, bool>();
+  public static bool StartHook() {
+    if (hook != IntPtr.Zero) return true;
+    cb = new WinEventProc(OnEvent);
+    hook = SetWinEventHook(0x8000, 0x8002, IntPtr.Zero, cb, 0, 0, 0 /*OUTOFCONTEXT*/);
+    return hook != IntPtr.Zero;
+  }
+  static void OnEvent(IntPtr hk, uint ev, IntPtr h, int idObj, int idChild, uint thread, uint time) {
+    try {
+      if (idObj != 0 || idChild != 0 || h == IntPtr.Zero || HookAumid == null) return;
+      if (GetAncestor(h, 2 /*GA_ROOT*/) != h) return;
+      uint pid; GetWindowThreadProcessId(h, out pid); bool mine;
+      if (!pids.TryGetValue(pid, out mine)) {
+        try { mine = string.Equals(System.Diagnostics.Process.GetProcessById((int)pid).ProcessName, HookProc, StringComparison.OrdinalIgnoreCase); } catch { mine = false; }
+        if (pids.Count > 500) pids.Clear(); pids[pid] = mine;
+      }
+      if (mine && TagWindow(h) == 0) HookCount++;
+    } catch { }
+  }
+  public static int TagWindow(IntPtr h) {
+    Guid g = typeof(IPS).GUID; IPS s; int hr = SHGetPropertyStoreForWindow(h, ref g, out s); if (hr != 0) return hr;
+    try {
+      PK k = new PK(); k.f = new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3"); k.p = 5;
+      PV cur; if (s.GetValue(ref k, out cur) == 0 && cur.vt == 31 && Marshal.PtrToStringUni(cur.p) == HookAumid) return 1;
+      if (HookIcon != null && HookCmd != null) { SetStr(s, 2, HookCmd); SetStr(s, 4, "Grok Bot"); SetStr(s, 3, HookIcon + ",0"); }
+      return SetStr(s, 5, HookAumid);
+    } finally { Marshal.ReleaseComObject(s); }
+  }
   public static int SetWindowAumid(IntPtr h, string id) {
     Guid g = typeof(IPS).GUID; IPS s; int hr = SHGetPropertyStoreForWindow(h, ref g, out s); if (hr != 0) return hr;
     try {
@@ -183,12 +224,18 @@ function Sync-Grouping {
   if (-not $cfg -or -not $cfg.aumid -or $script:h -eq 0 -or -not [GBTWin]::IsWindow($script:h)) { return }
   if ($script:groupedH -eq $script:h) { return }
   try {
-    $hr = [GBTWin]::SetWindowAumid($script:h, [string]$cfg.aumid)
+    $hr = [GBTWin]::TagWindow($script:h)
     if ($hr -ge 0) { $script:groupedH = $script:h; if ($hr -eq 0) { Log "Grouped the app window under the pin ($($cfg.aumid))" } }
     else { Log ("Grouping failed: 0x{0:X8}" -f $hr); $script:groupedH = $script:h }
   } catch { Log "Grouping failed: $_"; $script:groupedH = $script:h }
 }
 $script:groupedH = [IntPtr]::Zero
+
+function Get-LnkIcon {
+  # Shortcut icon: versioned file from config.json (avoids stale Explorer icon cache), else the tray icon.
+  if ($cfg -and $cfg.icon -and (Test-Path -LiteralPath $cfg.icon)) { return [string]$cfg.icon }
+  return (Join-Path $dir 'GrokBotTray.ico')
+}
 
 function Repair-Pin {
   # Updates can rewrite shortcuts. Point the taskbar pin back at the helper with the badged icon.
@@ -197,7 +244,7 @@ function Repair-Pin {
     $ws = New-Object -ComObject WScript.Shell
     $s = $ws.CreateShortcut($cfg.pinPath)
     $launcher = Join-Path $dir 'Grok Bot Tray.exe'
-    $ico = Join-Path $dir 'GrokBotTray.ico'
+    $ico = Get-LnkIcon
     if ($s.TargetPath -ne $launcher -or $s.IconLocation -ne "$ico,0") {
       $s.TargetPath = $launcher; $s.WorkingDirectory = $dir; $s.IconLocation = "$ico,0"; $s.Save()
       Log 'Taskbar pin repointed at the helper after an update'
@@ -211,7 +258,7 @@ function Set-Startup([bool]$on) {
       $ws = New-Object -ComObject WScript.Shell
       $s = $ws.CreateShortcut($startupLnk)
       $s.TargetPath = Join-Path $dir 'Grok Bot Tray.exe'; $s.WorkingDirectory = $dir
-      $s.IconLocation = (Join-Path $dir 'GrokBotTray.ico') + ',0'; $s.Description = 'Grok Bot in the notification area (unofficial helper)'
+      $s.IconLocation = (Get-LnkIcon) + ',0'; $s.Description = 'Grok Bot in the notification area (unofficial helper)'
       $s.Save(); Log 'Start with Windows: on'
     } else { Remove-Item -LiteralPath $startupLnk -Force -ErrorAction SilentlyContinue; Log 'Start with Windows: off' }
   } catch { Log "Set-Startup failed: $_"; $ni.ShowBalloonTip(4000, 'Grok Bot Tray', "Could not change the startup setting: $_", 'Error') }
@@ -449,5 +496,10 @@ $timer.add_Tick({
     }
   } catch { Log "Tick error: $_" }
 })
+if ($cfg -and $cfg.aumid) {
+  [GBTWin]::HookAumid = [string]$cfg.aumid; [GBTWin]::HookProc = $pname
+  [GBTWin]::HookCmd = '"' + (Join-Path $dir 'Grok Bot Tray.exe') + '"'; [GBTWin]::HookIcon = (Get-LnkIcon)
+  try { if ([GBTWin]::StartHook()) { Log 'Window hook on: new Grok Bot windows group under the pin at once' } else { Log 'Window hook unavailable; grouping falls back to the timer' } } catch { Log "Window hook failed: $_" }
+}
 $timer.Start()
 try { [System.Windows.Forms.Application]::Run() } catch { Log "Fatal: $_" } finally { $ni.Visible = $false; $ni.Dispose(); Log 'Helper stopped' }

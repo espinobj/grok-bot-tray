@@ -1,6 +1,6 @@
 # Grok Bot Tray (unofficial)
 
-**Current stable release: v1.2.2** (branch `v1.2.2`; see [CHANGELOG.md](CHANGELOG.md)).
+**Current stable release: v1.2.3** (branch `v1.2.3`; see [CHANGELOG.md](CHANGELOG.md)).
 
 
 > **Unofficial community tool.** Not affiliated with, endorsed by, or supported by xAI. "Grok" and "Grok Bot" are names of their owner. This helper never modifies Grok Bot's own files.
