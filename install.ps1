@@ -181,11 +181,23 @@ foreach ($old in 'exe.txt', 'GrokBotTray.vbs') { Remove-Item (Join-Path $dest $o
 
 # ---------- icon ----------
 $ico = Join-Path $dest 'GrokBotTray.ico'
-$frames = @(16, 20, 24, 32, 40, 48, 64, 256 | ForEach-Object { New-BadgedFrame $AppPath $_ })
+$iconB64 = Join-Path $PSScriptRoot 'assets\icon.png.b64'   # PNG stored as base64 text
+function New-IconFrame([int]$size) {
+  # v1.2.2: green bot artwork (assets\icon.png.b64), clearly different from the stock Grok Bot icon.
+  if (-not (Test-Path $iconB64)) { return New-BadgedFrame $AppPath $size }
+  $ms = New-Object System.IO.MemoryStream(,[Convert]::FromBase64String((Get-Content $iconB64 -Raw)))
+  $src = [System.Drawing.Image]::FromStream($ms)
+  $bmp = New-Object System.Drawing.Bitmap($size, $size, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+  $g = [System.Drawing.Graphics]::FromImage($bmp)
+  $g.SmoothingMode = 'AntiAlias'; $g.PixelOffsetMode = 'HighQuality'; $g.InterpolationMode = 'HighQualityBicubic'
+  $g.Clear([System.Drawing.Color]::Transparent); $g.DrawImage($src, 0, 0, $size, $size)
+  $g.Dispose(); $src.Dispose(); $ms.Dispose(); return $bmp
+}
+$frames = @(16, 20, 24, 32, 40, 48, 64, 128, 256 | ForEach-Object { New-IconFrame $_ })
 Write-Ico $frames $ico
 if ($env:GBT_ICON_PREVIEW) { foreach ($f in $frames) { if ($f.Width -in 16, 24, 32) { $f.Save((Join-Path $env:GBT_ICON_PREVIEW ("tray-$($f.Width).png"))) } } }
 $frames | ForEach-Object { $_.Dispose() }
-Say 'Built badged icon'
+Say 'Built helper icon'
 
 # ---------- launcher exe ----------
 $launcher = Join-Path $dest "$name.exe"
@@ -234,7 +246,7 @@ if ($pinPath -and -not $NoPinUpdate) {
   $bk = Join-Path $dest 'backup\taskbar-pin.lnk'
   if ($ws.CreateShortcut($pinPath).TargetPath -ieq $AppPath -and -not (Test-Path $bk)) { Copy-Item $pinPath $bk }
   Set-Lnk $pinPath $aumid
-  Say 'Taskbar pin now opens the helper and shows the badged icon'
+  Say 'Taskbar pin now opens the helper and shows the helper icon'
 } elseif (-not $pinPath) {
   Say 'Tip: to pin it, open Start, find "Grok Bot Tray", right-click it and choose Pin to taskbar.'
   $pinPath = $null
@@ -247,5 +259,5 @@ if ($pinPath -and -not $NoPinUpdate) {
 # refresh Explorer's icon cache so the new icon shows without signing out
 try { Start-Process -FilePath (Join-Path $env:WINDIR 'System32\ie4uinit.exe') -ArgumentList '-show' -WindowStyle Hidden -Wait } catch {}
 
-if (-not $NoLaunch) { Start-Process -FilePath $launcher; Say 'Helper started. Look for the badged Grok Bot icon in the notification area.' }
+if (-not $NoLaunch) { Start-Process -FilePath $launcher; Say 'Helper started. Look for the green bot icon in the notification area.' }
 Say "Installed v$((Get-Content (Join-Path $PSScriptRoot 'VERSION') -Raw).Trim()) to $dest"

@@ -12,6 +12,22 @@ public static class GBTWin {
   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
   [DllImport("user32.dll")] public static extern bool DestroyIcon(IntPtr h);
+  [StructLayout(LayoutKind.Sequential, Pack=4)] public struct PK { public Guid f; public uint p; }
+  [StructLayout(LayoutKind.Explicit, Size=24)] public struct PV { [FieldOffset(0)] public ushort vt; [FieldOffset(8)] public IntPtr p; }
+  [ComImport, Guid("886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+  interface IPS { int GetCount(out uint c); int GetAt(uint i, out PK k); int GetValue(ref PK k, out PV v); int SetValue(ref PK k, ref PV v); int Commit(); }
+  [DllImport("shell32.dll")] static extern int SHGetPropertyStoreForWindow(IntPtr h, ref Guid g, [MarshalAs(UnmanagedType.Interface)] out IPS s);
+  // Give the app window the pinned shortcut's AppUserModelID so it groups under the helper pin
+  // (the app's own process ID, e.g. electron.app.Grok Bot, differs from its shortcut ID).
+  public static int SetWindowAumid(IntPtr h, string id) {
+    Guid g = typeof(IPS).GUID; IPS s; int hr = SHGetPropertyStoreForWindow(h, ref g, out s); if (hr != 0) return hr;
+    try {
+      PK k = new PK(); k.f = new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3"); k.p = 5;
+      PV cur; if (s.GetValue(ref k, out cur) == 0 && cur.vt == 31 && Marshal.PtrToStringUni(cur.p) == id) return 1;
+      PV v = new PV(); v.vt = 31; v.p = Marshal.StringToCoTaskMemUni(id);
+      try { return s.SetValue(ref k, ref v); } finally { Marshal.FreeCoTaskMem(v.p); }
+    } finally { Marshal.ReleaseComObject(s); }
+  }
 }
 "@
 
@@ -161,6 +177,18 @@ function Quit-All {
   $ni.Visible = $false
   [System.Windows.Forms.Application]::Exit()
 }
+
+function Sync-Grouping {
+  # One taskbar button: tag the app window with the pin's AppUserModelID (window property only; app files untouched).
+  if (-not $cfg -or -not $cfg.aumid -or $script:h -eq 0 -or -not [GBTWin]::IsWindow($script:h)) { return }
+  if ($script:groupedH -eq $script:h) { return }
+  try {
+    $hr = [GBTWin]::SetWindowAumid($script:h, [string]$cfg.aumid)
+    if ($hr -ge 0) { $script:groupedH = $script:h; if ($hr -eq 0) { Log "Grouped the app window under the pin ($($cfg.aumid))" } }
+    else { Log ("Grouping failed: 0x{0:X8}" -f $hr); $script:groupedH = $script:h }
+  } catch { Log "Grouping failed: $_"; $script:groupedH = $script:h }
+}
+$script:groupedH = [IntPtr]::Zero
 
 function Repair-Pin {
   # Updates can rewrite shortcuts. Point the taskbar pin back at the helper with the badged icon.
@@ -344,6 +372,7 @@ $timer.add_Tick({
     if ($showEvent.WaitOne(0)) { $script:hideNext = $false; Show-App }
     $now = Get-Date
     Show-UpdateResult
+    Sync-Grouping
     if ($now -ge $script:nextAutoCheck) {
       $script:nextAutoCheck = $now.AddHours($AutoCheckEveryHours)
       if ($script:settings.autoUpdate) {
