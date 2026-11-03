@@ -24,49 +24,100 @@ public static class GBTWin {
     PV v = new PV(); v.vt = 31; v.p = Marshal.StringToCoTaskMemUni(val);
     try { return s.SetValue(ref k, ref v); } finally { Marshal.FreeCoTaskMem(v.p); }
   }
-  // v1.2.3: tag new app windows the moment they are created/shown (WinEvent hook), so a second
-  // stock-icon button never flashes up. Also sets the relaunch icon to the helper icon.
-  public static string HookAumid, HookIcon, HookCmd, HookProc; public static int HookCount;
+  // v1.2.4: the WinEvent hook callback only queues the window handle. All property-store (COM)
+  // work happens once per window on a background worker thread, so the helper's UI thread never
+  // makes a cross-process call that could stall, and a slow call never holds up Grok Bot.
+  public static string HookAumid, HookIcon, HookCmd, HookExe; public static int HookCount, StuckCount;
   delegate void WinEventProc(IntPtr hook, uint ev, IntPtr h, int idObj, int idChild, uint thread, uint time);
   [DllImport("user32.dll")] static extern IntPtr SetWinEventHook(uint min, uint max, IntPtr mod, WinEventProc cb, uint pid, uint tid, uint flags);
+  [DllImport("user32.dll")] static extern bool UnhookWinEvent(IntPtr h);
   [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
   [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr h, uint f);
-  static WinEventProc cb; static IntPtr hook;
-  static System.Collections.Generic.Dictionary<uint, bool> pids = new System.Collections.Generic.Dictionary<uint, bool>();
+  [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr h, int c);
+  static WinEventProc cb; static IntPtr hookCreate, hookShow;
+  static readonly object gate = new object();
+  static System.Collections.Generic.HashSet<uint> pids = new System.Collections.Generic.HashSet<uint>();
+  static System.Collections.Generic.HashSet<uint> otherPids = new System.Collections.Generic.HashSet<uint>();
+  [DllImport("kernel32.dll")] static extern IntPtr OpenProcess(uint a, bool i, uint pid);
+  [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode)] static extern bool QueryFullProcessImageName(IntPtr h, uint f, System.Text.StringBuilder b, ref uint n);
+  // Kernel-only lookup (no window messages): is this process the Grok Bot exe? Runs on the worker.
+  static bool IsAppPid(uint pid) {
+    lock (gate) { if (pids.Contains(pid)) return true; if (otherPids.Contains(pid)) return false; }
+    bool mine = false; IntPtr ph = OpenProcess(0x1000 /*QUERY_LIMITED_INFORMATION*/, false, pid);
+    if (ph != IntPtr.Zero) { try { var b = new System.Text.StringBuilder(1024); uint n = 1024;
+      if (QueryFullProcessImageName(ph, 0, b, ref n)) mine = HookExe != null && string.Equals(System.IO.Path.GetFileName(b.ToString()), HookExe, StringComparison.OrdinalIgnoreCase);
+    } finally { CloseHandle(ph); } }
+    lock (gate) { if (mine) pids.Add(pid); else { if (otherPids.Count > 2000) otherPids.Clear(); otherPids.Add(pid); } }
+    return mine;
+  }
+  static System.Collections.Generic.HashSet<long> tagged = new System.Collections.Generic.HashSet<long>();
+  static System.Collections.Generic.HashSet<long> queuedSet = new System.Collections.Generic.HashSet<long>();
+  static System.Collections.Concurrent.BlockingCollection<IntPtr> queue = new System.Collections.Concurrent.BlockingCollection<IntPtr>();
+  static System.Threading.Thread worker; static long busySince; static long busyHwnd;
+  // Grok Bot process IDs, refreshed by the helper's timer (no process lookups inside the hook).
+  public static void SetPids(int[] list) { lock (gate) { pids.Clear(); otherPids.Clear(); foreach (int p in list) pids.Add((uint)p); } }
+  public static bool IsTagged(IntPtr h) { lock (gate) { return tagged.Contains(h.ToInt64()); } }
+  public static void Enqueue(IntPtr h) {
+    if (h == IntPtr.Zero) return; long k = h.ToInt64();
+    lock (gate) { if (tagged.Contains(k) || queuedSet.Contains(k)) return; queuedSet.Add(k); }
+    queue.Add(h);
+  }
   public static bool StartHook() {
-    if (hook != IntPtr.Zero) return true;
+    if (hookCreate != IntPtr.Zero) return true;
+    StartWorker();
     cb = new WinEventProc(OnEvent);
-    hook = SetWinEventHook(0x8000, 0x8002, IntPtr.Zero, cb, 0, 0, 0 /*OUTOFCONTEXT*/);
-    return hook != IntPtr.Zero;
+    // EVENT_OBJECT_CREATE (0x8000) and EVENT_OBJECT_SHOW (0x8002) only; WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS.
+    hookCreate = SetWinEventHook(0x8000, 0x8000, IntPtr.Zero, cb, 0, 0, 0x0000 | 0x0002);
+    hookShow = SetWinEventHook(0x8002, 0x8002, IntPtr.Zero, cb, 0, 0, 0x0000 | 0x0002);
+    return hookCreate != IntPtr.Zero && hookShow != IntPtr.Zero;
+  }
+  public static void StopHook() {
+    if (hookCreate != IntPtr.Zero) { UnhookWinEvent(hookCreate); hookCreate = IntPtr.Zero; }
+    if (hookShow != IntPtr.Zero) { UnhookWinEvent(hookShow); hookShow = IntPtr.Zero; }
   }
   static void OnEvent(IntPtr hk, uint ev, IntPtr h, int idObj, int idChild, uint thread, uint time) {
     try {
       if (idObj != 0 || idChild != 0 || h == IntPtr.Zero || HookAumid == null) return;
-      if (GetAncestor(h, 2 /*GA_ROOT*/) != h) return;
-      uint pid; GetWindowThreadProcessId(h, out pid); bool mine;
-      if (!pids.TryGetValue(pid, out mine)) {
-        try { mine = string.Equals(System.Diagnostics.Process.GetProcessById((int)pid).ProcessName, HookProc, StringComparison.OrdinalIgnoreCase); } catch { mine = false; }
-        if (pids.Count > 500) pids.Clear(); pids[pid] = mine;
-      }
-      if (mine && TagWindow(h) == 0) HookCount++;
+      uint pid; GetWindowThreadProcessId(h, out pid);
+      lock (gate) { if (otherPids.Contains(pid)) return; }   // known non-Grok Bot process: drop
+      if (GetAncestor(h, 2 /*GA_ROOT*/) != h) return;   // top-level windows only
+      Enqueue(h);   // Grok Bot or not-yet-known process: the worker checks it
     } catch { }
   }
-  public static int TagWindow(IntPtr h) {
+  public static void StartWorker() {
+    worker = new System.Threading.Thread(Work); worker.IsBackground = true; worker.Name = "GrokBotTray tagger";
+    worker.SetApartmentState(System.Threading.ApartmentState.STA); worker.Start();
+  }
+  static void Work() {
+    foreach (IntPtr h in queue.GetConsumingEnumerable()) {
+      long k = h.ToInt64();
+      lock (gate) { queuedSet.Remove(k); if (tagged.Contains(k)) continue; }
+      if (!IsWindow(h)) continue;
+      uint wp; GetWindowThreadProcessId(h, out wp); if (!IsAppPid(wp)) continue;
+      lock (gate) { tagged.Add(k); }   // once per window, even if the call fails
+      System.Threading.Interlocked.Exchange(ref busyHwnd, k);
+      System.Threading.Interlocked.Exchange(ref busySince, DateTime.UtcNow.Ticks);
+      try { if (TagWindow(h) == 0) System.Threading.Interlocked.Increment(ref HookCount); } catch { }
+      System.Threading.Interlocked.Exchange(ref busySince, 0);
+      if (worker != System.Threading.Thread.CurrentThread) return;   // replaced by the watchdog while stuck
+    }
+  }
+  // Timeout guard: if one call takes longer than maxSec, abandon that worker (it is a background
+  // thread and the window stays marked as done) and start a fresh one for the rest of the queue.
+  public static bool Watchdog(int maxSec) {
+    long t = System.Threading.Interlocked.Read(ref busySince);
+    if (t == 0 || (DateTime.UtcNow.Ticks - t) < TimeSpan.FromSeconds(maxSec).Ticks) return false;
+    System.Threading.Interlocked.Exchange(ref busySince, 0); StuckCount++; StartWorker(); return true;
+  }
+  public static void TrimTagged() { lock (gate) { tagged.RemoveWhere(k => !IsWindow(new IntPtr(k))); } }
+  static int TagWindow(IntPtr h) {
     Guid g = typeof(IPS).GUID; IPS s; int hr = SHGetPropertyStoreForWindow(h, ref g, out s); if (hr != 0) return hr;
     try {
       PK k = new PK(); k.f = new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3"); k.p = 5;
       PV cur; if (s.GetValue(ref k, out cur) == 0 && cur.vt == 31 && Marshal.PtrToStringUni(cur.p) == HookAumid) return 1;
       if (HookIcon != null && HookCmd != null) { SetStr(s, 2, HookCmd); SetStr(s, 4, "Grok Bot"); SetStr(s, 3, HookIcon + ",0"); }
       return SetStr(s, 5, HookAumid);
-    } finally { Marshal.ReleaseComObject(s); }
-  }
-  public static int SetWindowAumid(IntPtr h, string id) {
-    Guid g = typeof(IPS).GUID; IPS s; int hr = SHGetPropertyStoreForWindow(h, ref g, out s); if (hr != 0) return hr;
-    try {
-      PK k = new PK(); k.f = new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3"); k.p = 5;
-      PV cur; if (s.GetValue(ref k, out cur) == 0 && cur.vt == 31 && Marshal.PtrToStringUni(cur.p) == id) return 1;
-      PV v = new PV(); v.vt = 31; v.p = Marshal.StringToCoTaskMemUni(id);
-      try { return s.SetValue(ref k, ref v); } finally { Marshal.FreeCoTaskMem(v.p); }
     } finally { Marshal.ReleaseComObject(s); }
   }
 }
@@ -199,37 +250,40 @@ function Show-App {
   }
   if (-not (Test-Running)) { $script:launches.Clear(); Start-App $false; return }
   if ($script:h -eq 0 -or -not [GBTWin]::IsWindow($script:h)) { $script:h = Find-Win }
-  if ($script:h -ne 0) { [GBTWin]::ShowWindow($script:h, 9) | Out-Null; [GBTWin]::SetForegroundWindow($script:h) | Out-Null }
+  if ($script:h -ne 0) { [GBTWin]::ShowWindowAsync($script:h, 9) | Out-Null; [GBTWin]::SetForegroundWindow($script:h) | Out-Null }
   else { Start-Process -FilePath $exe -WorkingDirectory $installDir }   # app is single-instance; this surfaces it
 }
 function Hide-App {
   if ($script:h -eq 0 -or -not [GBTWin]::IsWindow($script:h)) { $script:h = Find-Win }
-  if ($script:h -ne 0) { [GBTWin]::ShowWindow($script:h, 0) | Out-Null }
+  if ($script:h -ne 0) { [GBTWin]::ShowWindowAsync($script:h, 0) | Out-Null }
 }
 function Quit-All {
+  # v1.2.4: quits only the helper. Grok Bot keeps running and is never closed or killed.
   $script:quitting = $true
-  Log 'Quit requested from tray menu'
-  if ($script:h -ne 0) { [GBTWin]::ShowWindow($script:h, 9) | Out-Null }
-  foreach ($p in @(Get-Process -Name $pname -ErrorAction SilentlyContinue)) { try { $p.CloseMainWindow() | Out-Null } catch {} }
-  $deadline = (Get-Date).AddSeconds(8)
-  while ((Test-Running) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 300 }
-  if ($script:main -and -not $script:main.HasExited) { & taskkill.exe /PID $script:main.Id /T | Out-Null; Start-Sleep 3 }
-  if (Test-Running) { Get-Process -Name $pname -ErrorAction SilentlyContinue | Stop-Process -Force }
+  Log 'Quit requested from tray menu (helper only; Grok Bot left running)'
+  try { [GBTWin]::StopHook() } catch {}
+  if ($script:h -ne 0 -and [GBTWin]::IsWindow($script:h)) { [GBTWin]::ShowWindowAsync($script:h, 9) | Out-Null }   # never leave it hidden
   $ni.Visible = $false
   [System.Windows.Forms.Application]::Exit()
 }
 
 function Sync-Grouping {
-  # One taskbar button: tag the app window with the pin's AppUserModelID (window property only; app files untouched).
-  if (-not $cfg -or -not $cfg.aumid -or $script:h -eq 0 -or -not [GBTWin]::IsWindow($script:h)) { return }
-  if ($script:groupedH -eq $script:h) { return }
-  try {
-    $hr = [GBTWin]::TagWindow($script:h)
-    if ($hr -ge 0) { $script:groupedH = $script:h; if ($hr -eq 0) { Log "Grouped the app window under the pin ($($cfg.aumid))" } }
-    else { Log ("Grouping failed: 0x{0:X8}" -f $hr); $script:groupedH = $script:h }
-  } catch { Log "Grouping failed: $_"; $script:groupedH = $script:h }
+  # Cheap backup for the hook: queue Grok Bot windows that are not tagged yet. The worker thread
+  # does the actual tagging; nothing here calls into Grok Bot's windows.
+  if (-not $cfg -or -not $cfg.aumid) { return }
+  $now = Get-Date
+  if (($now - $script:lastPidSync).TotalSeconds -ge 2) {
+    $script:lastPidSync = $now
+    $ps = @(Get-Process -Name $pname -ErrorAction SilentlyContinue)
+    [GBTWin]::SetPids([int[]]@($ps | ForEach-Object { $_.Id }))
+    foreach ($p in $ps) { $w = $p.MainWindowHandle; if ($w -ne 0 -and -not [GBTWin]::IsTagged($w)) { [GBTWin]::Enqueue($w) } }
+  }
+  if ($script:h -ne 0 -and -not [GBTWin]::IsTagged($script:h)) { [GBTWin]::Enqueue($script:h) }
+  if ([GBTWin]::HookCount -ne $script:loggedTags) { $script:loggedTags = [GBTWin]::HookCount; Log "Grouped Grok Bot window(s) under the pin ($($cfg.aumid)); total $($script:loggedTags)" }
+  if ([GBTWin]::Watchdog(5)) { Log 'Window tagging call took over 5 s; skipped that window and started a fresh worker' }
+  if (($now - $script:lastTrim).TotalMinutes -ge 10) { $script:lastTrim = $now; [GBTWin]::TrimTagged() }
 }
-$script:groupedH = [IntPtr]::Zero
+$script:lastPidSync = [DateTime]::MinValue; $script:lastTrim = Get-Date; $script:loggedTags = 0
 
 function Get-LnkIcon {
   # Shortcut icon: versioned file from config.json (avoids stale Explorer icon cache), else the tray icon.
@@ -387,7 +441,7 @@ $cm.Items.Add($miAuto) | Out-Null
 $cm.Items.Add('Check for updates').add_Click({ Check-Updates }) | Out-Null
 $cm.add_Opening({ $miStartup.Checked = Test-Path -LiteralPath $startupLnk; $miAuto.Checked = [bool]$script:settings.autoUpdate })
 $cm.Items.Add('-') | Out-Null
-$cm.Items.Add('Quit Grok Bot').add_Click({ Quit-All }) | Out-Null
+$cm.Items.Add('Quit tray helper').add_Click({ Quit-All }) | Out-Null
 $ni.ContextMenuStrip = $cm
 $ni.add_MouseClick({ param($s, $e)
   if ($e.Button -eq 'Left') {
@@ -446,10 +500,10 @@ $timer.add_Tick({
         }
         if ($script:h -eq 0 -or -not [GBTWin]::IsWindow($script:h)) {
           $w = Find-Win
-          if ($w -ne 0) { $script:h = $w; if ($script:hideNext) { [GBTWin]::ShowWindow($w, 0) | Out-Null; $script:hideNext = $false } }
+          if ($w -ne 0) { $script:h = $w; if ($script:hideNext) { [GBTWin]::ShowWindowAsync($w, 0) | Out-Null; $script:hideNext = $false } }
         }
         # minimize = hide to tray
-        if ($script:h -ne 0 -and [GBTWin]::IsIconic($script:h) -and [GBTWin]::IsWindowVisible($script:h)) { [GBTWin]::ShowWindow($script:h, 0) | Out-Null }
+        if ($script:h -ne 0 -and [GBTWin]::IsIconic($script:h) -and [GBTWin]::IsWindowVisible($script:h)) { [GBTWin]::ShowWindowAsync($script:h, 0) | Out-Null }
         if ($ni.Text -ne 'Grok Bot') { $ni.Text = 'Grok Bot' }
       }
       'Exited' {
@@ -497,9 +551,9 @@ $timer.add_Tick({
   } catch { Log "Tick error: $_" }
 })
 if ($cfg -and $cfg.aumid) {
-  [GBTWin]::HookAumid = [string]$cfg.aumid; [GBTWin]::HookProc = $pname
+  [GBTWin]::HookAumid = [string]$cfg.aumid; [GBTWin]::HookExe = [IO.Path]::GetFileName($exe)
   [GBTWin]::HookCmd = '"' + (Join-Path $dir 'Grok Bot Tray.exe') + '"'; [GBTWin]::HookIcon = (Get-LnkIcon)
-  try { if ([GBTWin]::StartHook()) { Log 'Window hook on: new Grok Bot windows group under the pin at once' } else { Log 'Window hook unavailable; grouping falls back to the timer' } } catch { Log "Window hook failed: $_" }
+  try { if ([GBTWin]::StartHook()) { Log 'Window hook on (queue only; tagging on a worker thread)' } else { Log 'Window hook unavailable; grouping falls back to the timer' } } catch { Log "Window hook failed: $_" }
 }
 $timer.Start()
-try { [System.Windows.Forms.Application]::Run() } catch { Log "Fatal: $_" } finally { $ni.Visible = $false; $ni.Dispose(); Log 'Helper stopped' }
+try { [System.Windows.Forms.Application]::Run() } catch { Log "Fatal: $_" } finally { try { [GBTWin]::StopHook() } catch {}; $ni.Visible = $false; $ni.Dispose(); Log 'Helper stopped' }
