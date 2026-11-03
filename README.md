@@ -53,7 +53,7 @@ Right-click the tray icon:
 | Open log | Opens `%LOCALAPPDATA%\GrokBotTray\tray.log` in Notepad |
 | Auto-update | Checkmark toggle (on by default): check GitHub at start and daily, install newer versions automatically |
 | Check for updates | Asks GitHub for the newest version and offers Install now (or open this page) |
-| Quit Grok Bot | Closes Grok Bot and the helper |
+| Quit tray helper | Closes only the helper; Grok Bot keeps running |
 
 Left-click shows or hides Grok Bot. See [CHANGELOG.md](CHANGELOG.md) for what changed in each version.
 
@@ -92,7 +92,7 @@ If it sees any of these, it waits until they've been gone for a few seconds, giv
 - Explorer caches icons. If an old icon sticks around after install, sign out and back in.
 - If Grok Bot's own "open at login" setting is on, both start at sign-in; that's fine, the helper just attaches to the running app.
 - Update detection is heuristic. A very long update (over 20 minutes) is treated as finished.
-- "Quit Grok Bot" in the tray menu asks the app to close, then ends it if it doesn't close within a few seconds.
+- "Quit tray helper" in the tray menu closes only the helper. It never closes or kills Grok Bot.
 
 ## Testing
 

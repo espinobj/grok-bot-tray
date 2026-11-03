@@ -1,6 +1,17 @@
 # Changelog
 
-## v1.2.3 - 2026-10-28 (current stable release)
+## v1.2.4 - 2026-11-01 (current stable release)
+
+Tested on Windows 11 / Windows PowerShell 5.1 (BlackKnight), including a 48-hour watch of the Application event log: no hangs attributable to the tray helper (all Grok Bot hangs recorded in that window were Windows DNS Client / DNSResolver waits, unrelated to the helper).
+
+- Fix: Grok Bot could hang ("AppHangXProcB1", waiting on another process) every few hours after v1.2.3. The v1.2.3 window hook did COM property-store calls and process lookups inside the hook callback on the helper's UI thread, for every window create/destroy/show on the system. Now:
+  - The hook listens only to window create and show (`WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS`), only for Grok Bot process IDs and top-level windows, and does nothing but queue the window handle.
+  - A background worker thread tags each window once (already-tagged windows are skipped). A watchdog abandons any tagging call that takes over 5 seconds and starts a fresh worker, so a slow call cannot stall anything.
+  - The 1-second timer only queues untagged windows as a backup.
+- Fix: all show/hide calls on Grok Bot's window use `ShowWindowAsync`, so the helper never waits on Grok Bot's window.
+- Change: the tray menu item is now **Quit tray helper**. It closes only the helper and never closes or kills Grok Bot (v1.2.3 and earlier force-killed Grok Bot if it did not close within 8 seconds). The self-updater also only stops the helper.
+
+## v1.2.3 - 2026-10-28
 
 - Fix: after upgrading, the taskbar pin could keep showing the old icon because Explorer caches icons by file path. Shortcuts (pin, Start menu, Startup, desktop) now use a versioned icon file (`icon-v123.ico`, recorded in `config.json`); older `icon-v*.ico` files are removed. The tray keeps using `GrokBotTray.ico`.
 - Fix: while Grok Bot was opening, a second stock-icon taskbar button flashed up until the helper's 1-second timer tagged the window. The helper now uses a WinEvent hook (window create/show) to tag Grok Bot windows the instant they appear, and also sets the window's relaunch icon/command to the helper. The timer remains as a fallback.
