@@ -1,6 +1,12 @@
 # Changelog
 
-## v1.2.4 - 2026-11-01 (current stable release)
+## v1.2.5 - 2026-11-23
+
+- Fix: closing Grok Bot's window brought it back. Current builds exit the whole process with code 0 on close, and the helper treated every exit as "restart in about 20 seconds". The new window then showed itself. A code-0 exit is still watched for about 20 seconds in case it is an update. If no update appears, Grok Bot stays quit until the tray icon or Show is clicked. Minimizing still hides the window to the tray. Crashes (any non-zero code, including 134) still restart after about 4 seconds. The update wait, reattach, and "start it if the installer didn't" flow is unchanged.
+- Fix: Grok Bot could be started twice within a minute. The helper now keeps the process it launched, skips a start when that process is alive or a launch is already in progress, and no longer treats "the new process has not shown up yet" as a crash that starts another copy.
+- Fix: the tray right-click menu was intermittent and slow. The helper was running in the multithreaded apartment, where the WinForms menu is unreliable, and the UI thread was also taking the system-wide window hook and the process scans. The launcher starts PowerShell with `-STA` (the script relaunches itself once if it was not). The window hook has its own thread. Process and update checks run in the background, so opening the menu does not wait on them. Left-click is handled on mouse-up and does not share a click handler with the menu.
+
+## v1.2.4 - 2026-11-01
 
 Tested on Windows 11 / Windows PowerShell 5.1 (BlackKnight), including a 48-hour watch of the Application event log: no hangs attributable to the tray helper (all Grok Bot hangs recorded in that window were Windows DNS Client / DNSResolver waits, unrelated to the helper).
 

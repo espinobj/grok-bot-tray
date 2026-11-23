@@ -1,7 +1,23 @@
 # Grok Bot Tray - unofficial community helper. Not affiliated with or endorsed by xAI.
-# Keeps the Grok Bot desktop app in the notification area (tray) and restarts it if it
-# crashes, but waits quietly while the app is updating instead of relaunching mid-update.
+# Keeps the Grok Bot desktop app in the notification area (tray). Minimizing hides the
+# window. Closing the window (the app exits with code 0) leaves it quit until the tray
+# icon is clicked, so a deliberate close never brings the window back. Crashes are
+# restarted. An update is waited out instead of relaunching mid-update.
 $ErrorActionPreference = 'Stop'
+# WinForms (the tray menu especially) is only reliable on an STA thread. The launcher
+# passes -STA; if the script is started without it, relaunch once before taking the
+# single-instance mutex so this process is not mistaken for the running helper.
+if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
+  if ($env:GBT_STA_RELAUNCH -eq '1') { Write-Error 'Grok Bot Tray needs STA PowerShell (powershell.exe -STA).'; exit 1 }
+  $env:GBT_STA_RELAUNCH = '1'
+  $ps = (Get-Process -Id $PID).Path
+  $arg = "-STA -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`""
+  Start-Process -FilePath $ps -ArgumentList $arg -WindowStyle Hidden
+  exit 0
+}
+$policy = Join-Path $PSScriptRoot 'policy.ps1'
+if (-not (Test-Path -LiteralPath $policy)) { Write-Error "Missing $policy"; exit 1 }
+. $policy
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 Add-Type @"
 using System; using System.Runtime.InteropServices;
@@ -34,7 +50,17 @@ public static class GBTWin {
   [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
   [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr h, uint f);
   [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr h, int c);
+  // v1.2.5: the hook callback runs on its own thread (see HookPump), not the UI thread.
+  [DllImport("user32.dll")] static extern int GetMessage(out MSG m, IntPtr h, uint min, uint max);
+  [DllImport("user32.dll")] static extern bool PeekMessage(out MSG m, IntPtr h, uint min, uint max, uint remove);
+  [DllImport("user32.dll")] static extern bool TranslateMessage(ref MSG m);
+  [DllImport("user32.dll")] static extern IntPtr DispatchMessage(ref MSG m);
+  [DllImport("user32.dll")] static extern bool PostThreadMessage(uint tid, uint msg, IntPtr w, IntPtr l);
+  [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+  [StructLayout(LayoutKind.Sequential)] struct MSG { public IntPtr hwnd; public uint message; public IntPtr wParam; public IntPtr lParam; public uint time; public int x; public int y; }
   static WinEventProc cb; static IntPtr hookCreate, hookShow;
+  static System.Threading.Thread hookPump; static uint hookTid; static volatile bool hookStop; static volatile int hookState;
+  static System.Threading.ManualResetEvent hookStarted;
   static readonly object gate = new object();
   static System.Collections.Generic.HashSet<uint> pids = new System.Collections.Generic.HashSet<uint>();
   static System.Collections.Generic.HashSet<uint> otherPids = new System.Collections.Generic.HashSet<uint>();
@@ -51,12 +77,23 @@ public static class GBTWin {
     lock (gate) { if (mine) pids.Add(pid); else { if (otherPids.Count > 2000) otherPids.Clear(); otherPids.Add(pid); } }
     return mine;
   }
+  // Same kernel lookup, for the background update scan. Does not send window messages.
+  public static string ImagePath(int pid) {
+    if (pid <= 0) return null;
+    IntPtr ph = OpenProcess(0x1000, false, (uint)pid);
+    if (ph == IntPtr.Zero) return null;
+    try {
+      var b = new System.Text.StringBuilder(1024); uint n = 1024;
+      if (!QueryFullProcessImageName(ph, 0, b, ref n)) return null;
+      return b.ToString();
+    } finally { CloseHandle(ph); }
+  }
   static System.Collections.Generic.HashSet<long> tagged = new System.Collections.Generic.HashSet<long>();
   static System.Collections.Generic.HashSet<long> queuedSet = new System.Collections.Generic.HashSet<long>();
   static System.Collections.Concurrent.BlockingCollection<IntPtr> queue = new System.Collections.Concurrent.BlockingCollection<IntPtr>();
   static System.Threading.Thread worker; static long busySince; static long busyHwnd;
-  // Grok Bot process IDs, refreshed by the helper's timer (no process lookups inside the hook).
-  public static void SetPids(int[] list) { lock (gate) { pids.Clear(); otherPids.Clear(); foreach (int p in list) pids.Add((uint)p); } }
+  // Grok Bot process IDs, refreshed by the background watch (no process lookups inside the hook).
+  public static void SetPids(int[] list) { lock (gate) { pids.Clear(); otherPids.Clear(); if (list == null) return; foreach (int p in list) pids.Add((uint)p); } }
   public static bool IsTagged(IntPtr h) { lock (gate) { return tagged.Contains(h.ToInt64()); } }
   public static void Enqueue(IntPtr h) {
     if (h == IntPtr.Zero) return; long k = h.ToInt64();
@@ -64,17 +101,44 @@ public static class GBTWin {
     queue.Add(h);
   }
   public static bool StartHook() {
-    if (hookCreate != IntPtr.Zero) return true;
-    StartWorker();
-    cb = new WinEventProc(OnEvent);
-    // EVENT_OBJECT_CREATE (0x8000) and EVENT_OBJECT_SHOW (0x8002) only; WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS.
-    hookCreate = SetWinEventHook(0x8000, 0x8000, IntPtr.Zero, cb, 0, 0, 0x0000 | 0x0002);
-    hookShow = SetWinEventHook(0x8002, 0x8002, IntPtr.Zero, cb, 0, 0, 0x0000 | 0x0002);
-    return hookCreate != IntPtr.Zero && hookShow != IntPtr.Zero;
+    if (hookPump != null) return hookState == 1;
+    hookStarted = new System.Threading.ManualResetEvent(false);
+    hookPump = new System.Threading.Thread(HookPump);
+    hookPump.IsBackground = true; hookPump.Name = "GrokBotTray hook";
+    hookPump.SetApartmentState(System.Threading.ApartmentState.STA);
+    hookPump.Start();
+    hookStarted.WaitOne(5000);
+    return hookState == 1;
   }
-  public static void StopHook() {
+  // Message loop for the out-of-context WinEvent hook. Callbacks stay off the UI thread
+  // so a burst of window events cannot delay the tray menu. Unhook on this thread only.
+  static void HookPump() {
+    MSG prime; PeekMessage(out prime, IntPtr.Zero, 0, 0, 0); // creates this thread's message queue
+    hookTid = GetCurrentThreadId();
+    try {
+      StartWorker();
+      cb = new WinEventProc(OnEvent);
+      // EVENT_OBJECT_CREATE (0x8000) and EVENT_OBJECT_SHOW (0x8002) only; WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS.
+      hookCreate = SetWinEventHook(0x8000, 0x8000, IntPtr.Zero, cb, 0, 0, 0x0000 | 0x0002);
+      hookShow = SetWinEventHook(0x8002, 0x8002, IntPtr.Zero, cb, 0, 0, 0x0000 | 0x0002);
+      hookState = (hookCreate != IntPtr.Zero && hookShow != IntPtr.Zero) ? 1 : -1;
+    } catch { hookState = -1; }
+    hookStarted.Set();
+    if (hookState != 1 || hookStop) { UnhookAll(); return; }
+    MSG msg;
+    while (GetMessage(out msg, IntPtr.Zero, 0, 0) > 0) { TranslateMessage(ref msg); DispatchMessage(ref msg); }
+    UnhookAll();
+  }
+  static void UnhookAll() {
     if (hookCreate != IntPtr.Zero) { UnhookWinEvent(hookCreate); hookCreate = IntPtr.Zero; }
     if (hookShow != IntPtr.Zero) { UnhookWinEvent(hookShow); hookShow = IntPtr.Zero; }
+  }
+  public static void StopHook() {
+    hookStop = true;
+    uint tid = hookTid;
+    if (tid != 0) PostThreadMessage(tid, 0x0012 /*WM_QUIT*/, IntPtr.Zero, IntPtr.Zero);
+    var t = hookPump;
+    if (t != null && t != System.Threading.Thread.CurrentThread) { try { t.Join(2000); } catch { } }
   }
   static void OnEvent(IntPtr hk, uint ev, IntPtr h, int idObj, int idChild, uint thread, uint time) {
     try {
@@ -121,6 +185,22 @@ public static class GBTWin {
     } finally { Marshal.ReleaseComObject(s); }
   }
 }
+// Shared with the background watch thread. The UI thread only reads it.
+public sealed class GBTBox {
+  public bool WantSignal;
+  public bool WantMain;
+  public int MainPid;
+  public long Hwnd;
+  public bool Running;
+  public string Signal;
+  public long SignalStartedTicks;
+  public long SignalReadyTicks;
+  public string ScanError;
+  public int Loops;
+  public int WatchdogSeen;
+  public int[] Pids = new int[0];
+  public readonly System.Threading.ManualResetEvent Stop = new System.Threading.ManualResetEvent(false);
+}
 "@
 
 # --- single instance: a second launch just asks the running helper to show the app ---
@@ -162,100 +242,232 @@ $script:settings = Get-Settings
 Log "Helper v$Version started for $exe"
 
 # --- tunables ---
-$GraceCleanExitSec = 20    # after a clean exit (code 0), watch this long for an updater before relaunching
-$GraceCrashSec     = 4     # after a crash, relaunch after this long (if no updater shows up)
+$GraceCleanExitSec = 20    # after a clean exit (code 0), watch this long for an updater; then leave it closed
+$GraceCrashSec     = 4     # after a crash, relaunch after this long (once a post-exit update scan is in)
 $QuietAfterUpdateSec = 12  # updater gone and exe untouched this long = update finished
 $WaitForSelfRestartSec = 45 # after an update, give the installer this long to start the app itself
 $MaxUpdateMinutes  = 20    # never wait longer than this for an update
 $MaxRelaunches = 3; $RelaunchWindowMin = 10
+$HideAfterRelaunchSec = 8  # keep a crash relaunch hidden while the app tries to show its window
 
 # --- state ---
 $script:h = [IntPtr]::Zero
 $script:main = $null           # System.Diagnostics.Process of the app's main process
-$script:state = 'Running'      # Running | Exited | Updating | AfterUpdate | Stopped
+$script:state = 'Running'      # Running | Exited | Updating | AfterUpdate | Closed | Stopped
 $script:since = Get-Date
 $script:exitCode = $null
+$script:exitSeenAt = $null     # local time the tracked process exited; update scans must start after this
+$script:exitPending = $false   # tracked process exited, a sibling may still be shutting down
 $script:hideNext = $false
+$script:hideUntil = [datetime]::MinValue
 $script:quitting = $false
+$script:startGate = $false
+$script:lastStart = [datetime]::MinValue
+$script:lastSurface = [datetime]::MinValue
+$script:lastDirect = [datetime]::MinValue
 $script:launches = New-Object System.Collections.ArrayList
-$script:lastSignalCheck = [DateTime]::MinValue
 $script:exeStamp = $null
+$script:box = $null
+$script:loggedTags = 0
+$script:loggedStuck = 0
+$script:loggedScanError = ''
+$script:scannerNoted = $false
 
 function Get-ExeStamp {
   try { $f = Get-Item -LiteralPath $exe; return "{0}|{1}|{2}" -f $f.Length, $f.LastWriteTimeUtc.Ticks, $f.VersionInfo.FileVersion } catch { return $null }
 }
+function Test-ExeChanged {
+  if (-not $script:exeStamp) { return $false }
+  $stamp = Get-ExeStamp
+  if (-not $stamp) { return $false }
+  return ($stamp -ne $script:exeStamp)
+}
 function Find-Win { foreach ($p in @(Get-Process -Name $pname -ErrorAction SilentlyContinue)) { if ($p.MainWindowHandle -ne 0) { return $p.MainWindowHandle } }; return [IntPtr]::Zero }
-function Test-Running { [bool](Get-Process -Name $pname -ErrorAction SilentlyContinue) }
+function Test-AppRunning { return [bool](Get-Process -Name $pname -ErrorAction SilentlyContinue) }
 
-function Attach-Main {
-  # The Electron main process is the one without a --type= switch.
+function Get-SignalAgeSec {
+  $ready = [int64]0
+  try { if ($script:box) { $ready = [int64]$script:box.SignalReadyTicks } } catch { return 9999 }
+  if ($ready -le 0) { return 9999 }
+  return (([datetime]::UtcNow.Ticks - $ready) / [timespan]::TicksPerSecond)
+}
+function Test-ScanFresh {
+  if (-not $script:exitSeenAt -or -not $script:box) { return $false }
+  $started = [int64]0
+  try { $started = [int64]$script:box.SignalStartedTicks } catch { return $false }
+  return (Test-GbtScanFresh -SignalStartedTicks $started -ExitSeenAt $script:exitSeenAt)
+}
+
+# Adopt the main PID the background watch found. Get-Process -Id is cheap; the CIM
+# query that picks the Electron process without --type= runs on the watch thread.
+function Try-AdoptMain {
+  if (-not $script:box) { return $false }
+  $id = 0
+  try { $id = [int]$script:box.MainPid } catch { return $false }
+  if ($id -le 0) { $script:box.WantMain = $true; return $false }
   try {
-    $q = "Name='" + ($pname + '.exe').Replace("'", "''") + "'"
-    $mp = Get-CimInstance Win32_Process -Filter $q | Where-Object { $_.CommandLine -notmatch '--type=' } | Select-Object -First 1
-    if ($mp) {
-      $p = Get-Process -Id $mp.ProcessId -ErrorAction Stop
-      $null = $p.Handle   # open a handle now so ExitCode is readable after it exits
-      $script:main = $p
-      $script:exeStamp = Get-ExeStamp
-      return $true
-    }
-  } catch {}
-  $script:main = $null
+    $p = Get-Process -Id $id -ErrorAction Stop
+    try { $null = $p.Handle } catch {}
+    if ($p.HasExited) { $script:box.MainPid = 0; $script:box.WantMain = $true; return $false }
+    $script:main = $p
+    $script:exeStamp = Get-ExeStamp
+    return $true
+  } catch {
+    $script:box.MainPid = 0
+    $script:box.WantMain = $true
+    return $false
+  }
+}
+
+function Enter-Running([string]$why) {
+  if ($why) { Log $why }
+  $script:state = 'Running'
+  $script:since = Get-Date
+  $script:exitPending = $false
+  $script:exitCode = $null
+  if ($ni -and $ni.Text -ne 'Grok Bot') { $ni.Text = 'Grok Bot' }
+}
+function Enter-Exited([datetime]$now) {
+  Log "App exited (code=$($script:exitCode)); watching for an update before doing anything"
+  $script:state = 'Exited'
+  $script:since = $now
+  $script:exitSeenAt = $now
+  $script:exitPending = $false
+  $script:h = [IntPtr]::Zero
+  if ($script:box) { $script:box.WantSignal = $true }
+  if ($ni) {
+    if (Test-GbtCleanExit $script:exitCode) { $ni.Text = 'Grok Bot (closed - click to open)' }
+    else { $ni.Text = 'Grok Bot (closed)' }
+  }
+}
+function Enter-Closed([string]$why) {
+  Log $why
+  $script:state = 'Closed'
+  $script:exitPending = $false
+  $script:h = [IntPtr]::Zero
+  if ($ni) { $ni.Text = 'Grok Bot (closed - click to open)' }
+}
+
+function Resolve-Window([switch]$Search) {
+  if ($script:h -ne 0 -and [GBTWin]::IsWindow($script:h)) { return $true }
+  $script:h = [IntPtr]::Zero
+  $raw = [int64]0
+  try { if ($script:box) { $raw = [int64]$script:box.Hwnd } } catch {}
+  if ($raw -ne 0) {
+    $w = New-Object IntPtr ([int64]$raw)
+    if ([GBTWin]::IsWindow($w)) { $script:h = $w; return $true }
+  }
+  if ($Search) {
+    $w2 = Find-Win
+    if ($w2 -ne 0) { $script:h = $w2; return $true }
+  }
   return $false
 }
-
-function Get-UpdateSignal {
-  # Returns a short reason string when an update/install looks in progress, else $null.
-  try {
-    $f = Get-Item -LiteralPath $exe -ErrorAction Stop
-    if (((Get-Date) - $f.LastWriteTime).TotalSeconds -lt $QuietAfterUpdateSec) { return 'app exe was just written' }
-    try { $fs = [IO.File]::Open($exe, 'Open', 'Read', 'Read'); $fs.Close() } catch { return 'app exe is locked for writing' }
-  } catch { return 'app exe is missing' }
-  try {
-    foreach ($p in @(Get-CimInstance Win32_Process -Property Name, ExecutablePath, ProcessId)) {
-      $n = $p.Name; $path = $p.ExecutablePath
-      if ($n -ieq "$pname.exe") { continue }
-      if ($path -and $path.StartsWith($installDir + '\', [StringComparison]::OrdinalIgnoreCase)) { return "$n is running from the app folder" }
-      if ($n -ieq 'installer.exe' -and (-not $path -or $path -match '\\[^\\]+-updater\\')) { return "updater $n is running" }
-      if ($n -imatch '^(Au_|Un_A|Un)\.exe$') { return "installer helper $n is running" }
-      if ($n -ieq "Uninstall $pname.exe") { return "$n is running" }
-      if ($n -like "$pname*Setup*.exe" -or $n -like "$pname*Installer*.exe") { return "$n is running" }
-      if ($n -ieq 'Update.exe' -and $path -and $path -match 'Squirrel|' + [regex]::Escape($pname)) { return "Squirrel $n is running" }
-    }
-  } catch {}
-  return $null
+function Show-MainWindow {
+  if (-not (Resolve-Window -Search)) { return $false }
+  [GBTWin]::ShowWindowAsync($script:h, 9) | Out-Null
+  [GBTWin]::SetForegroundWindow($script:h) | Out-Null
+  return $true
 }
-
-function Start-App([bool]$hidden) {
-  $now = Get-Date
-  while ($script:launches.Count -gt 0 -and ($now - $script:launches[0]).TotalMinutes -gt $RelaunchWindowMin) { $script:launches.RemoveAt(0) }
-  if ($script:launches.Count -ge $MaxRelaunches) {
-    Log "Not relaunching: $MaxRelaunches launches in $RelaunchWindowMin min. Waiting for the user."
-    $script:state = 'Stopped'
-    $ni.Text = 'Grok Bot (stopped - click to start)'
-    $ni.ShowBalloonTip(5000, 'Grok Bot', 'Grok Bot keeps closing, so it was not restarted. Click the tray icon to start it.', 'Warning')
+function Update-Window([datetime]$now) {
+  if (-not (Resolve-Window)) { return }
+  $forceHide = $script:hideNext -or ($now -lt $script:hideUntil)
+  if ($forceHide) {
+    if ([GBTWin]::IsWindowVisible($script:h)) { [GBTWin]::ShowWindowAsync($script:h, 0) | Out-Null }
+    $script:hideNext = $false
     return
   }
-  [void]$script:launches.Add($now)
-  $script:hideNext = $hidden
-  $script:h = [IntPtr]::Zero
-  Log "Starting app (hidden=$hidden)"
-  try { Start-Process -FilePath $exe -WorkingDirectory $installDir } catch { Log "Start failed: $_" }
-  $script:state = 'Running'; $script:since = $now; $script:main = $null
+  # minimize = hide to tray
+  if ([GBTWin]::IsIconic($script:h) -and [GBTWin]::IsWindowVisible($script:h)) { [GBTWin]::ShowWindowAsync($script:h, 0) | Out-Null }
+}
+
+function Request-Surface {
+  # The app is single-instance; a second launch asks the running one to show its window.
+  # Debounced so a click cannot stack processes while the window handle is still unknown.
+  $now = Get-Date
+  if (($now - $script:lastSurface).TotalSeconds -lt 5) { return }
+  $script:lastSurface = $now
+  Log 'App is running but has no window yet; asking it to show'
+  try { Start-Process -FilePath $exe -WorkingDirectory $installDir | Out-Null } catch { Log "Show request failed: $_" }
+}
+
+function Start-App([bool]$hidden, [bool]$automatic) {
+  # $automatic is crash recovery only. A manual open (tray click, Show) does not count
+  # toward the relaunch limit and is never hidden.
+  $tracked = $false
+  if ($script:main) { try { $tracked = -not $script:main.HasExited } catch { $tracked = $false } }
+  $any = Test-AppRunning
+  $recent = -1
+  if ($script:lastStart -gt [datetime]'2000-01-01') { $recent = [int]((Get-Date) - $script:lastStart).TotalSeconds }
+  $decision = Get-GbtLaunchDecision -Quitting $script:quitting -InFlight $script:startGate -TrackedAlive $tracked -AnyRunning $any -SecondsSinceLaunch $recent
+  if ($decision -eq 'skip-already-running') {
+    Log 'Start skipped: app is already running; reattaching'
+    if (-not $tracked) { [void](Try-AdoptMain) }
+    Enter-Running $null
+    if (-not $hidden) { if (-not (Show-MainWindow)) { Request-Surface } }
+    return
+  }
+  if ($decision -ne 'start') { Log "Start skipped ($decision)"; return }
+  if ($automatic) {
+    $t = Get-Date
+    while ($script:launches.Count -gt 0 -and ($t - $script:launches[0]).TotalMinutes -gt $RelaunchWindowMin) { $script:launches.RemoveAt(0) }
+    if ($script:launches.Count -ge $MaxRelaunches) {
+      Log "Not relaunching: $MaxRelaunches launches in $RelaunchWindowMin min. Waiting for the user."
+      $script:state = 'Stopped'
+      $script:exitPending = $false
+      $ni.Text = 'Grok Bot (stopped - click to start)'
+      $ni.ShowBalloonTip(5000, 'Grok Bot', 'Grok Bot keeps closing, so it was not restarted. Click the tray icon to start it.', 'Warning')
+      return
+    }
+  }
+  $script:startGate = $true
+  try {
+    Log "Starting app (hidden=$hidden)"
+    $p = Start-Process -FilePath $exe -WorkingDirectory $installDir -PassThru
+    try { $null = $p.Handle } catch {}   # keep ExitCode readable after it exits
+    $script:main = $p
+    if ($script:box) { $script:box.MainPid = $p.Id; $script:box.WantMain = $false }
+    $script:lastStart = Get-Date
+    $script:hideNext = $hidden
+    if ($hidden) { $script:hideUntil = $script:lastStart.AddSeconds($HideAfterRelaunchSec) } else { $script:hideUntil = [datetime]::MinValue }
+    $script:h = [IntPtr]::Zero
+    $script:exitCode = $null
+    $script:exitPending = $false
+    $script:state = 'Running'
+    $script:since = $script:lastStart
+    $script:exeStamp = Get-ExeStamp
+    if ($automatic) { [void]$script:launches.Add($script:lastStart) }
+    if ($ni -and $ni.Text -ne 'Grok Bot') { $ni.Text = 'Grok Bot' }
+  } catch {
+    Log "Start failed: $_"
+    $script:state = 'Closed'
+    $script:exitPending = $false
+    if ($ni) { $ni.Text = 'Grok Bot (closed - click to open)' }
+  } finally { $script:startGate = $false }
 }
 
 function Show-App {
   if ($script:state -eq 'Updating' -or $script:state -eq 'AfterUpdate') {
     $ni.ShowBalloonTip(3000, 'Grok Bot', 'Grok Bot is updating. It will come back when the update finishes.', 'Info'); return
   }
-  if (-not (Test-Running)) { $script:launches.Clear(); Start-App $false; return }
-  if ($script:h -eq 0 -or -not [GBTWin]::IsWindow($script:h)) { $script:h = Find-Win }
-  if ($script:h -ne 0) { [GBTWin]::ShowWindowAsync($script:h, 9) | Out-Null; [GBTWin]::SetForegroundWindow($script:h) | Out-Null }
-  else { Start-Process -FilePath $exe -WorkingDirectory $installDir }   # app is single-instance; this surfaces it
+  if ($script:state -eq 'Exited' -and $script:box) {
+    $sig = [string]$script:box.Signal
+    if ($sig -and (Get-SignalAgeSec) -le 3) {
+      $ni.ShowBalloonTip(3000, 'Grok Bot', 'Grok Bot is updating. It will come back when the update finishes.', 'Info'); return
+    }
+  }
+  $script:hideNext = $false
+  $script:hideUntil = [datetime]::MinValue
+  $alive = $false
+  if ($script:main) { try { $alive = -not $script:main.HasExited } catch { $alive = $false } }
+  if (-not $alive) { $alive = Test-AppRunning }
+  if (-not $alive) { $script:launches.Clear(); Start-App $false $false; return }
+  Enter-Running $null
+  if (-not (Show-MainWindow)) { Request-Surface }
 }
 function Hide-App {
-  if ($script:h -eq 0 -or -not [GBTWin]::IsWindow($script:h)) { $script:h = Find-Win }
-  if ($script:h -ne 0) { [GBTWin]::ShowWindowAsync($script:h, 0) | Out-Null }
+  if (-not (Resolve-Window -Search)) { return }
+  [GBTWin]::ShowWindowAsync($script:h, 0) | Out-Null
 }
 function Quit-All {
   # v1.2.4: quits only the helper. Grok Bot keeps running and is never closed or killed.
@@ -267,23 +479,137 @@ function Quit-All {
   [System.Windows.Forms.Application]::Exit()
 }
 
-function Sync-Grouping {
-  # Cheap backup for the hook: queue Grok Bot windows that are not tagged yet. The worker thread
-  # does the actual tagging; nothing here calls into Grok Bot's windows.
-  if (-not $cfg -or -not $cfg.aumid) { return }
-  $now = Get-Date
-  if (($now - $script:lastPidSync).TotalSeconds -ge 2) {
-    $script:lastPidSync = $now
-    $ps = @(Get-Process -Name $pname -ErrorAction SilentlyContinue)
-    [GBTWin]::SetPids([int[]]@($ps | ForEach-Object { $_.Id }))
-    foreach ($p in $ps) { $w = $p.MainWindowHandle; if ($w -ne 0 -and -not [GBTWin]::IsTagged($w)) { [GBTWin]::Enqueue($w) } }
+function Note-Grouping {
+  # Logging only. PID refresh, enqueue, trim, and the tagging watchdog run on the watch thread.
+  if ($cfg -and $cfg.aumid -and [GBTWin]::HookCount -ne $script:loggedTags) {
+    $script:loggedTags = [GBTWin]::HookCount
+    Log "Grouped Grok Bot window(s) under the pin ($($cfg.aumid)); total $($script:loggedTags)"
   }
-  if ($script:h -ne 0 -and -not [GBTWin]::IsTagged($script:h)) { [GBTWin]::Enqueue($script:h) }
-  if ([GBTWin]::HookCount -ne $script:loggedTags) { $script:loggedTags = [GBTWin]::HookCount; Log "Grouped Grok Bot window(s) under the pin ($($cfg.aumid)); total $($script:loggedTags)" }
-  if ([GBTWin]::Watchdog(5)) { Log 'Window tagging call took over 5 s; skipped that window and started a fresh worker' }
-  if (($now - $script:lastTrim).TotalMinutes -ge 10) { $script:lastTrim = $now; [GBTWin]::TrimTagged() }
+  $seen = 0
+  try { if ($script:box) { $seen = [int]$script:box.WatchdogSeen } } catch {}
+  if ($seen -gt $script:loggedStuck) {
+    $script:loggedStuck = $seen
+    Log 'Window tagging call took over 5 s; skipped that window and started a fresh worker'
+  }
+  if (-not $script:scannerNoted) {
+    $loops = 0
+    try { if ($script:box) { $loops = [int]$script:box.Loops } } catch {}
+    if ($loops -gt 0) { $script:scannerNoted = $true; Log 'Background watch on (process and update checks off the UI thread)' }
+    elseif ($script:scanner -and $script:scanner.HadErrors) {
+      $script:scannerNoted = $true
+      $err = @($script:scanner.Streams.Error) | Select-Object -First 1
+      Log "Background watch failed: $err"
+    }
+  }
+  if ($script:box -and $script:box.ScanError -and $script:box.ScanError -ne $script:loggedScanError) {
+    $script:loggedScanError = [string]$script:box.ScanError
+    Log "Background scan: $($script:loggedScanError)"
+  }
 }
-$script:lastPidSync = [DateTime]::MinValue; $script:lastTrim = Get-Date; $script:loggedTags = 0
+
+function Start-Scanner {
+  # Process list, main-PID lookup, and the update-signal walk. Never on the UI thread:
+  # a full process scan (and CIM) is what made the tray menu stall.
+  $script:box = New-Object GBTBox
+  $rs = [runspacefactory]::CreateRunspace()
+  $rs.ApartmentState = 'MTA'
+  $rs.Open()
+  $ps = [powershell]::Create()
+  $ps.Runspace = $rs
+  $watch = {
+    param($box, $exePath, $installDir, $pname, $quiet, $policyPath)
+    $ErrorActionPreference = 'Continue'
+    try { . $policyPath } catch { $box.ScanError = "policy load: $_"; return }
+    $lastTrim = [datetime]::UtcNow
+    while (-not $box.Stop.WaitOne(0)) {
+      try {
+        $procs = @(Get-Process -Name $pname -ErrorAction SilentlyContinue)
+        $ids = New-Object System.Collections.Generic.List[int]
+        $hwnd = [int64]0
+        foreach ($p in $procs) {
+          try {
+            [void]$ids.Add([int]$p.Id)
+            $hw = [int64]$p.MainWindowHandle
+            if ($hwnd -eq 0 -and $hw -ne 0) { $hwnd = $hw }
+          } catch {}
+        }
+        $arr = [int[]]$ids.ToArray()
+        $box.Pids = $arr
+        $box.Running = ($ids.Count -gt 0)
+        $box.Hwnd = $hwnd
+        try { [GBTWin]::SetPids($arr) } catch { $box.ScanError = "pids: $_" }
+        foreach ($p in $procs) {
+          try {
+            $w = $p.MainWindowHandle
+            if ($w -ne 0 -and -not [GBTWin]::IsTagged($w)) { [GBTWin]::Enqueue($w) }
+          } catch {}
+        }
+        foreach ($p in $procs) { try { $p.Dispose() } catch {} }
+        if ($box.WantMain -and $box.MainPid -le 0) {
+          try {
+            $q = "Name='" + ($pname + '.exe').Replace("'", "''") + "'"
+            $mp = @(Get-CimInstance Win32_Process -Filter $q | Where-Object { $_.CommandLine -notmatch '--type=' }) | Select-Object -First 1
+            if ($mp) { $box.MainPid = [int]$mp.ProcessId }
+          } catch { $box.ScanError = "main process: $_" }
+        }
+        if ($box.WantSignal) {
+          $started = [datetime]::UtcNow.Ticks
+          $snaps = New-Object System.Collections.Generic.List[object]
+          foreach ($gp in [System.Diagnostics.Process]::GetProcesses()) {
+            try {
+              $path = $null
+              try { $path = [GBTWin]::ImagePath([int]$gp.Id) } catch {}
+              $snaps.Add([pscustomobject]@{ Name = ($gp.ProcessName + '.exe'); Path = $path })
+            } catch {}
+            finally { try { $gp.Dispose() } catch {} }
+          }
+          try {
+            $box.Signal = Get-GbtUpdateSignal -Exe $exePath -InstallDir $installDir -ProcessName $pname -QuietSec $quiet -Processes $snaps.ToArray()
+            $box.SignalStartedTicks = $started
+            $box.SignalReadyTicks = [datetime]::UtcNow.Ticks
+          } catch { $box.ScanError = "update signal: $_" }
+        }
+        try { [void][GBTWin]::Watchdog(5) } catch {}
+        try { $box.WatchdogSeen = [GBTWin]::StuckCount } catch {}
+        if (([datetime]::UtcNow - $lastTrim).TotalMinutes -ge 10) { $lastTrim = [datetime]::UtcNow; try { [GBTWin]::TrimTagged() } catch {} }
+        $box.Loops = $box.Loops + 1
+      } catch { $box.ScanError = "$_" }
+      if ($box.Stop.WaitOne(1000)) { break }
+    }
+  }
+  [void]$ps.AddScript($watch.ToString()).AddArgument($script:box).AddArgument($exe).AddArgument($installDir).AddArgument($pname).AddArgument([int]$QuietAfterUpdateSec).AddArgument((Join-Path $PSScriptRoot 'policy.ps1'))
+  $script:scanner = $ps
+  $script:scannerRs = $rs
+  $script:scannerHandle = $ps.BeginInvoke()
+}
+function Get-UpdateSignalNow {
+  # One-shot update check for the helper's own updater. Not used by the 1-second tick.
+  # The tick reads the background watch instead, so the tray menu never waits on this.
+  $snaps = New-Object System.Collections.Generic.List[object]
+  foreach ($gp in [System.Diagnostics.Process]::GetProcesses()) {
+    try {
+      $path = $null
+      try { $path = [GBTWin]::ImagePath([int]$gp.Id) } catch {}
+      [void]$snaps.Add([pscustomobject]@{ Name = ($gp.ProcessName + '.exe'); Path = $path })
+    } catch {}
+    finally { try { $gp.Dispose() } catch {} }
+  }
+  return (Get-GbtUpdateSignal -Exe $exe -InstallDir $installDir -ProcessName $pname -QuietSec $QuietAfterUpdateSec -Processes $snaps.ToArray())
+}
+function Stop-Scanner {
+  try { if ($script:box) { [void]$script:box.Stop.Set() } } catch {}
+  try {
+    if ($script:scannerHandle) {
+      if (-not $script:scannerHandle.AsyncWaitHandle.WaitOne(5000)) {
+        try { [void]$script:scanner.Stop() } catch {}
+        [void]$script:scannerHandle.AsyncWaitHandle.WaitOne(2000)
+      }
+      if ($script:scannerHandle.IsCompleted) { try { [void]$script:scanner.EndInvoke($script:scannerHandle) } catch {} }
+    }
+  } catch {}
+  try { if ($script:scanner) { $script:scanner.Dispose() } } catch {}
+  try { if ($script:scannerRs) { $script:scannerRs.Close(); $script:scannerRs.Dispose() } } catch {}
+}
 
 function Get-LnkIcon {
   # Shortcut icon: versioned file from config.json (avoids stale Explorer icon cache), else the tray icon.
@@ -360,7 +686,7 @@ function Get-LatestVersion { $l = Get-Latest; if ($l) { return $l.Version }; ret
 function Install-Update($latest, [bool]$manual = $false) {
   if ($script:installing -and ((Get-Date) - $script:installing).TotalMinutes -lt 5) { Log 'Update already in progress'; return $false }
   # Download the ref zip, verify it, then hand off to a detached updater (it backs up, installs, rolls back on failure).
-  if ($script:state -in 'Updating', 'AfterUpdate' -or (Get-UpdateSignal)) { Log 'Helper update postponed: Grok Bot itself is updating'; return $false }
+  if ($script:state -in 'Updating', 'AfterUpdate' -or (Get-UpdateSignalNow)) { Log 'Helper update postponed: Grok Bot itself is updating'; return $false }
   $want = $latest.Version.ToString()
   $ProgressPreference = 'SilentlyContinue'
   [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
@@ -376,7 +702,7 @@ function Install-Update($latest, [bool]$manual = $false) {
       Expand-Archive -Path $zip -DestinationPath (Join-Path $tmp 'x') -Force
       $pkg = @(Get-ChildItem (Join-Path $tmp 'x') -Directory)[0].FullName
     }
-    foreach ($f in 'VERSION', 'install.ps1', 'src\GrokBotTray.ps1', 'src\update.ps1', 'src\launcher.cs') {
+    foreach ($f in 'VERSION', 'install.ps1', 'src\GrokBotTray.ps1', 'src\policy.ps1', 'src\update.ps1', 'src\launcher.cs') {
       if (-not (Test-Path (Join-Path $pkg $f))) { throw "package is missing $f" }
     }
     $pv = (Get-Content (Join-Path $pkg 'VERSION') -Raw).Trim()
@@ -419,6 +745,8 @@ function Check-Updates {
 }
 
 # --- tray icon (drawn at the exact small-icon size so the badge stays visible) ---
+try { [System.Windows.Forms.Application]::EnableVisualStyles() } catch {}
+try { [System.Windows.Forms.Application]::SetCompatibleTextRenderingDefault($false) } catch {}
 $ni = New-Object System.Windows.Forms.NotifyIcon
 try { $ni.Icon = New-Object System.Drawing.Icon((Join-Path $dir 'GrokBotTray.ico'), [System.Windows.Forms.SystemInformation]::SmallIconSize) }
 catch { Log "Icon load failed: $_"; $ni.Icon = [System.Drawing.Icon]::ExtractAssociatedIcon($exe) }
@@ -439,17 +767,23 @@ $miAuto = New-Object System.Windows.Forms.ToolStripMenuItem('Auto-update')
 $miAuto.add_Click({ $script:settings.autoUpdate = -not [bool]$script:settings.autoUpdate; Save-Settings $script:settings; Log "Auto-update: $($script:settings.autoUpdate)" })
 $cm.Items.Add($miAuto) | Out-Null
 $cm.Items.Add('Check for updates').add_Click({ Check-Updates }) | Out-Null
-$cm.add_Opening({ $miStartup.Checked = Test-Path -LiteralPath $startupLnk; $miAuto.Checked = [bool]$script:settings.autoUpdate })
+$cm.add_Opening({
+  try { $miStartup.Checked = Test-Path -LiteralPath $startupLnk; $miAuto.Checked = [bool]$script:settings.autoUpdate } catch {}
+})
 $cm.Items.Add('-') | Out-Null
 $cm.Items.Add('Quit tray helper').add_Click({ Quit-All }) | Out-Null
+# Right-click is the menu's own mouse-up path. A MouseClick handler races that path and
+# drops or dismisses the menu, so left-click is MouseUp only and ignores the right button.
 $ni.ContextMenuStrip = $cm
-$ni.add_MouseClick({ param($s, $e)
-  if ($e.Button -eq 'Left') {
-    if ($script:state -eq 'Stopped') { $script:launches.Clear(); Start-App $false; return }
-    if ($script:h -ne 0 -and [GBTWin]::IsWindow($script:h) -and [GBTWin]::IsWindowVisible($script:h) -and -not [GBTWin]::IsIconic($script:h)) { Hide-App } else { Show-App }
-  } })
-
-if (Test-Running) { [void](Attach-Main) } else { Start-App $false }
+$ni.add_MouseUp({
+  param($s, $e)
+  try {
+    if ($e.Button -ne [System.Windows.Forms.MouseButtons]::Left) { return }
+    [void](Resolve-Window)
+    $visible = $script:h -ne 0 -and [GBTWin]::IsWindow($script:h) -and [GBTWin]::IsWindowVisible($script:h) -and -not [GBTWin]::IsIconic($script:h)
+    if ($visible) { Hide-App } else { Show-App }
+  } catch { Log "Click error: $_" }
+})
 
 $resFile = Join-Path $dir 'update-result.json'
 function Show-UpdateResult {
@@ -470,10 +804,11 @@ $timer.Interval = 1000
 $timer.add_Tick({
   try {
     if ($script:quitting) { return }
-    if ($showEvent.WaitOne(0)) { $script:hideNext = $false; Show-App }
+    if ($showEvent.WaitOne(0)) { $script:hideNext = $false; $script:hideUntil = [datetime]::MinValue; Show-App }
     $now = Get-Date
     Show-UpdateResult
-    Sync-Grouping
+    Note-Grouping
+    if ($script:box) { $script:box.WantSignal = ($script:state -in 'Exited', 'Updating', 'AfterUpdate') }
     if ($now -ge $script:nextAutoCheck) {
       $script:nextAutoCheck = $now.AddHours($AutoCheckEveryHours)
       if ($script:settings.autoUpdate) {
@@ -483,47 +818,76 @@ $timer.add_Tick({
     }
     switch ($script:state) {
       'Running' {
-        $alive = $false
-        if ($script:main) { $alive = -not $script:main.HasExited } else { $alive = Test-Running; if ($alive) { [void](Attach-Main) } }
-        if (-not $alive -and $script:main) {
+        $trackedAlive = $false
+        if ($script:main) { try { $trackedAlive = -not $script:main.HasExited } catch { $trackedAlive = $false } }
+        if ($script:main -and -not $trackedAlive) {
           try { $script:exitCode = $script:main.ExitCode } catch { $script:exitCode = $null }
           $script:main = $null
-          if (Test-Running) { [void](Attach-Main); return }   # another instance took over
-          Log "App exited (code=$($script:exitCode)); watching for an update before doing anything"
-          $script:state = 'Exited'; $script:since = $now; $script:h = [IntPtr]::Zero
-          $ni.Text = 'Grok Bot (closed)'
+          if ($script:box) { $script:box.MainPid = 0; $script:box.WantMain = $true }
+          # A stub can exit 0 while the real Electron process is still starting. Reattach
+          # if anything is left; otherwise this exit code is the one we act on.
+          if (Test-AppRunning) {
+            if (Try-AdoptMain) { Enter-Running 'App process changed; reattached' } else { $script:exitPending = $true }
+            return
+          }
+          Enter-Exited $now
           return
         }
-        if (-not $alive) {
-          if (($now - $script:since).TotalSeconds -gt 30) { $script:state = 'Exited'; $script:since = $now; $script:exitCode = $null }
+        if ($script:exitPending) {
+          if ($script:box.Running -or (Test-AppRunning)) {
+            if (Try-AdoptMain) { Enter-Running 'App is running again; reattached' }
+            return
+          }
+          Enter-Exited $now
           return
         }
-        if ($script:h -eq 0 -or -not [GBTWin]::IsWindow($script:h)) {
-          $w = Find-Win
-          if ($w -ne 0) { $script:h = $w; if ($script:hideNext) { [GBTWin]::ShowWindowAsync($w, 0) | Out-Null; $script:hideNext = $false } }
+        if (-not $script:main) {
+          $any = [bool]$script:box.Running
+          if ($any) { [void](Try-AdoptMain); return }
+          $elapsed = [int]($now - $script:since).TotalSeconds
+          $miss = Get-GbtMissingDecision -TrackedAlive $false -AnyRunning $false -ExitPending $false -ElapsedSec $elapsed
+          if ($miss -eq 'wait') { return }
+          if (($now - $script:lastDirect).TotalSeconds -ge 5) {
+            $script:lastDirect = $now
+            if (Test-AppRunning) { [void](Try-AdoptMain); return }
+          } else { return }
+          Enter-Closed 'App was not running; leaving it closed until the tray icon is clicked'
+          return
         }
-        # minimize = hide to tray
-        if ($script:h -ne 0 -and [GBTWin]::IsIconic($script:h) -and [GBTWin]::IsWindowVisible($script:h)) { [GBTWin]::ShowWindowAsync($script:h, 0) | Out-Null }
+        Update-Window $now
         if ($ni.Text -ne 'Grok Bot') { $ni.Text = 'Grok Bot' }
       }
       'Exited' {
-        if (Test-Running) { Log 'App is running again (started elsewhere); reattached'; [void](Attach-Main); $script:state = 'Running'; $script:since = $now; return }
-        if (($now - $script:lastSignalCheck).TotalSeconds -lt 2) { return }
-        $script:lastSignalCheck = $now
-        $sig = Get-UpdateSignal
-        $stamp = Get-ExeStamp
-        if (-not $sig -and $script:exeStamp -and $stamp -and $stamp -ne $script:exeStamp) { $sig = 'app exe changed (new version)' }
-        if ($sig) {
-          Log "Update detected: $sig. Waiting for it to finish."
-          $script:state = 'Updating'; $script:since = $now; $ni.Text = 'Grok Bot (updating...)'; return
+        if ($script:box.Running -or ($script:main -and -not $script:main.HasExited)) {
+          [void](Try-AdoptMain)
+          if ($script:main -and -not $script:main.HasExited) { Enter-Running 'App is running again (started elsewhere); reattached' }
+          return
         }
-        $grace = if ($script:exitCode -eq 0) { $GraceCleanExitSec } else { $GraceCrashSec }
-        if (($now - $script:since).TotalSeconds -ge $grace) { Start-App $true }
+        $elapsed = [int]($now - $script:since).TotalSeconds
+        $fileSig = Get-GbtUpdateSignal -Exe $exe -InstallDir $installDir -ProcessName $pname -QuietSec $QuietAfterUpdateSec -Processes @()
+        $fresh = Test-ScanFresh
+        if (-not $fresh -and $elapsed -ge 30) { $fresh = $true }   # a dead watch must not block crash recovery forever
+        $decision = Get-GbtExitDecision -ExitCode $script:exitCode -ElapsedSec $elapsed -Signal ([string]$script:box.Signal) -FileSignal $fileSig -ExeChanged (Test-ExeChanged) -RunningNow $false -ScanFresh $fresh -GraceCleanSec $GraceCleanExitSec -GraceCrashSec $GraceCrashSec
+        if ($decision -eq 'wait') { return }
+        if ($decision -eq 'updating') {
+          $why = $fileSig
+          if (-not $why) { $why = [string]$script:box.Signal }
+          if (-not $why) { $why = 'app exe changed (new version)' }
+          Log "Update detected: $why. Waiting for it to finish."
+          $script:state = 'Updating'; $script:since = $now; $script:quietSince = $null; $ni.Text = 'Grok Bot (updating...)'
+          return
+        }
+        if (Test-AppRunning) { $script:box.WantMain = $true; if (Try-AdoptMain) { Enter-Running 'App is running again (started elsewhere); reattached' }; return }
+        if ($decision -eq 'stay-closed') { Enter-Closed 'Clean exit (code=0) and no update; leaving Grok Bot closed until the tray icon is clicked'; return }
+        if ($decision -eq 'relaunch-hidden') { Start-App $true $true }
       }
       'Updating' {
-        if (($now - $script:lastSignalCheck).TotalSeconds -lt 2) { return }
-        $script:lastSignalCheck = $now
-        $sig = Get-UpdateSignal
+        $age = Get-SignalAgeSec
+        if ($age -gt 3) {
+          if (($now - $script:since).TotalMinutes -gt $MaxUpdateMinutes) { Log "Update still running after $MaxUpdateMinutes min; giving up waiting"; $script:state = 'AfterUpdate'; $script:since = $now.AddSeconds(-$WaitForSelfRestartSec) }
+          return
+        }
+        $sig = [string]$script:box.Signal
         if ($sig) {
           $script:quietSince = $null
           if (($now - $script:since).TotalMinutes -gt $MaxUpdateMinutes) { Log "Update still running after $MaxUpdateMinutes min ($sig); giving up waiting"; $script:state = 'AfterUpdate'; $script:since = $now.AddSeconds(-$WaitForSelfRestartSec) }
@@ -538,22 +902,39 @@ $timer.add_Tick({
         }
       }
       'AfterUpdate' {
-        if (Test-Running) { Log 'App restarted after the update; reattached'; [void](Attach-Main); $script:launches.Clear(); $script:state = 'Running'; $script:since = $now; $ni.Text = 'Grok Bot'; return }
+        if ($script:box.Running -or ($script:main -and -not $script:main.HasExited)) {
+          if (-not $script:main -or $script:main.HasExited) { [void](Try-AdoptMain) }
+          if ($script:main -and -not $script:main.HasExited) { Log 'App restarted after the update; reattached'; $script:launches.Clear(); Enter-Running $null }
+          return
+        }
         if (($now - $script:since).TotalSeconds -ge $WaitForSelfRestartSec) {
-          if (Get-UpdateSignal) { $script:state = 'Updating'; $script:since = $now; return }
-          $script:launches.Clear(); Start-App $false
+          $sig = [string]$script:box.Signal
+          if ($sig -and (Get-SignalAgeSec) -le 3) { $script:state = 'Updating'; $script:since = $now; $script:quietSince = $null; return }
+          $script:launches.Clear(); Start-App $false $false
         }
       }
+      'Closed' {
+        if ($script:box.Running) { [void](Try-AdoptMain); if ($script:main -and -not $script:main.HasExited) { Enter-Running 'App is running again (started elsewhere); reattached' } }
+      }
       'Stopped' {
-        if (Test-Running) { [void](Attach-Main); $script:state = 'Running'; $ni.Text = 'Grok Bot' }
+        if ($script:box.Running) { [void](Try-AdoptMain); if ($script:main -and -not $script:main.HasExited) { Enter-Running 'App is running again (started elsewhere); reattached' } }
       }
     }
   } catch { Log "Tick error: $_" }
 })
+try { Start-Scanner } catch { Log "Background watch failed to start: $_" }
+if (-not $script:box) { $script:box = New-Object GBTBox }
 if ($cfg -and $cfg.aumid) {
   [GBTWin]::HookAumid = [string]$cfg.aumid; [GBTWin]::HookExe = [IO.Path]::GetFileName($exe)
   [GBTWin]::HookCmd = '"' + (Join-Path $dir 'Grok Bot Tray.exe') + '"'; [GBTWin]::HookIcon = (Get-LnkIcon)
-  try { if ([GBTWin]::StartHook()) { Log 'Window hook on (queue only; tagging on a worker thread)' } else { Log 'Window hook unavailable; grouping falls back to the timer' } } catch { Log "Window hook failed: $_" }
+  try { if ([GBTWin]::StartHook()) { Log 'Window hook on (its own thread; tagging on a worker thread)' } else { Log 'Window hook unavailable; grouping falls back to the background watch' } } catch { Log "Window hook failed: $_" }
 }
+if (Test-AppRunning) { if ($script:box) { $script:box.WantMain = $true }; $script:state = 'Running'; $script:since = Get-Date; Log 'App already running; will attach' }
+else { Start-App $false $false }
 $timer.Start()
-try { [System.Windows.Forms.Application]::Run() } catch { Log "Fatal: $_" } finally { try { [GBTWin]::StopHook() } catch {}; $ni.Visible = $false; $ni.Dispose(); Log 'Helper stopped' }
+try { [System.Windows.Forms.Application]::Run() } catch { Log "Fatal: $_" } finally {
+  try { $timer.Stop() } catch {}
+  try { [GBTWin]::StopHook() } catch {}
+  try { Stop-Scanner } catch {}
+  $ni.Visible = $false; $ni.Dispose(); Log 'Helper stopped'
+}
