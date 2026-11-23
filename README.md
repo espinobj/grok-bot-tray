@@ -1,13 +1,13 @@
 # Grok Bot Tray (unofficial)
 
-**Current stable release: v1.2.4** (branch `v1.2.4`; see [CHANGELOG.md](CHANGELOG.md)).
+**Current stable release: v1.2.5** (branch `v1.2.5`; see [CHANGELOG.md](CHANGELOG.md)).
 
 
 > **Unofficial community tool.** Not affiliated with, endorsed by, or supported by xAI. "Grok" and "Grok Bot" are names of their owner. This helper never modifies Grok Bot's own files.
 
 A small per-user helper for Windows that keeps the **Grok Bot** desktop app in the notification area (system tray):
 
-- Left-click the tray icon to show or hide Grok Bot. Minimizing hides it to the tray.
+- Left-click the tray icon to show or hide Grok Bot. Minimizing hides it to the tray. Closing the window leaves Grok Bot quit until you click the tray icon; the window does not come back on its own.
 - Starts with Windows (optional) and keeps Grok Bot running if it crashes.
 - **Update-aware:** when Grok Bot closes to install an update, the helper waits for the installer to finish instead of relaunching the app mid-update, then reattaches (or starts it if the installer didn't).
 - Uses its own green bot icon (`assets/icon.png.b64`, a base64-encoded PNG) so you can tell the helper apart from the regular app, in the tray, on the launcher and on a taskbar pin.
@@ -82,12 +82,13 @@ When Grok Bot's main process exits, the helper records the exit code and then lo
 - an updater/installer process (e.g. `installer.exe` in a `*-updater` folder, `elevate.exe` or `Uninstall Grok Bot.exe` from the app folder, NSIS helpers like `Au_.exe`, Squirrel `Update.exe`, or a `Grok Bot*Setup*.exe`);
 - `Grok Bot.exe` missing, locked for writing, recently rewritten, or showing a new version.
 
-If it sees any of these, it waits until they've been gone for a few seconds, gives the installer time to restart Grok Bot itself, and only starts it if nothing did. After a clean exit with no update it waits about 20 seconds before restarting the app (hidden in the tray); after a crash about 4 seconds. If the app closes 3 times within 10 minutes it stops restarting it and shows a notification. Activity is logged to `%LOCALAPPDATA%\GrokBotTray\tray.log`.
+If it sees any of these, it waits until they've been gone for a few seconds, gives the installer time to restart Grok Bot itself, and only starts it if nothing did. A clean exit (code 0) is watched for about 20 seconds. If no update shows up, that was you closing the window: the helper leaves Grok Bot quit and does not open it again until you click the tray icon or choose Show. A crash (any other exit code, for example 134) restarts the app after about 4 seconds, hidden in the tray. If the app crashes 3 times within 10 minutes the helper stops restarting it and shows a notification. It will not start a second copy while one is already running or a launch is already in progress. Activity is logged to `%LOCALAPPDATA%\GrokBotTray\tray.log`.
 
 ## Limitations
 
 - Windows 10 or 11 only, and it needs Windows PowerShell 5.1 and .NET Framework 4 (both built in).
-- Hiding works by hiding Grok Bot's main window; if a future app version changes how its window works, show/hide may need an update.
+- Hiding works by hiding Grok Bot's main window; if a future app version changes how its window works, show/hide may need an update. Closing the window quits the current Grok Bot build (it exits with code 0). The helper does not keep that process alive and does not relaunch it.
+- The tray menu needs the helper to be running in a single-threaded PowerShell (`powershell.exe -STA`). The launcher does this. Right-click can still pause for a few seconds while the once-a-day GitHub update check is in progress.
 - Windows doesn't let programs pin to the taskbar. If you didn't have Grok Bot pinned, open Start, right-click **Grok Bot Tray** and choose **Pin to taskbar**.
 - Explorer caches icons. If an old icon sticks around after install, sign out and back in.
 - If Grok Bot's own "open at login" setting is on, both start at sign-in; that's fine, the helper just attaches to the running app.

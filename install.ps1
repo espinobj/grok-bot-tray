@@ -173,6 +173,7 @@ Start-Sleep -Milliseconds 500
 New-Item -ItemType Directory -Force -Path $dest | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $dest 'backup') | Out-Null
 Copy-Item (Join-Path $src 'GrokBotTray.ps1') $dest -Force
+Copy-Item (Join-Path $src 'policy.ps1') $dest -Force
 Copy-Item (Join-Path $src 'launcher.cs') $dest -Force
 Copy-Item (Join-Path $src 'update.ps1') $dest -Force
 Copy-Item (Join-Path $PSScriptRoot 'uninstall.ps1') $dest -Force
